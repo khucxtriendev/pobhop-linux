@@ -1,0 +1,1111 @@
+#!/usr/bin/env python3
+import ctypes
+try:
+    libc = ctypes.CDLL('libc.so.6')
+    if hasattr(libc, 'mallopt'):
+        libc.mallopt(-1, 65536)
+except Exception:
+    libc = None
+
+def trim_memory():
+    if libc and hasattr(libc, 'malloc_trim'):
+        libc.malloc_trim(0)
+
+#!/usr/bin/env python3
+"""podhop-daemon — High-speed AirPods audio-switching, ANC control & In-Ear detection daemon for Linux.
+
+Always listening in background:
+- Auto-pulls AirPods from iPhone when music/sound plays (~2s).
+- In-Ear Detection: Auto-pauses music via MPRIS when earbuds are removed; resumes on put-back.
+- Noise Control: ANC / Transparency / Adaptive / Off via AAP protocol.
+- Conversational Awareness toggle via AAP protocol.
+- Real-time sync: receives battery levels, stem-squeeze mode changes, and ear states.
+- IPC socket for GUI app.
+"""
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+PSM = 0x1001
+HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
+SET_FEATURES = bytes.fromhex("040004004d00d700000000000000")
+REQUEST_NOTIFICATIONS = bytes.fromhex("040004000f00ffffffffff")
+
+A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+CONFIG_PATH = os.path.expanduser("~/.config/podhop.json")
+UNIX_SOCK_PATH = f"/run/user/{os.getuid()}/podhop.sock"
+
+# AAP Packets sent to AirPods
+MODE_PACKETS = {
+    "anc": bytes.fromhex("0400040009000d02000000"),
+    "transparency": bytes.fromhex("0400040009000d03000000"),
+    "adaptive": bytes.fromhex("0400040009000d04000000"),
+    "off": bytes.fromhex("0400040009000d01000000"),
+}
+
+AWARENESS_PACKETS = {
+    True: bytes.fromhex("0400040009002801000000"),
+    False: bytes.fromhex("0400040009002802000000"),
+}
+
+# AAP Packets received from AirPods
+PKT_HANDSHAKE_ACK = bytes.fromhex("01000400")
+PKT_FEATURES_ACK = bytes.fromhex("040004002b00")
+PKT_LINK_DROP = bytes.fromhex("00010000")
+PKT_NOISE = bytes.fromhex("0400040009000d")
+PKT_AWARENESS = bytes.fromhex("04000400090028")
+PKT_BATTERY = bytes.fromhex("040004000400")
+PKT_EAR = bytes.fromhex("040004000600")
+
+NOISE_MAP = {
+    0x01: "off",
+    0x02: "anc",
+    0x03: "transparency",
+    0x04: "adaptive"
+}
+
+EAR_STATES = {
+    0x00: "in",
+    0x01: "out",
+    0x02: "case"
+}
+
+MODE_DISPLAY = {
+    "anc": "Chống ồn chủ động (ANC)",
+    "transparency": "Xuyên âm (Transparency)",
+    "adaptive": "Thích ứng (Adaptive)",
+    "off": "Tắt chống ồn (Off)"
+}
+
+MODE_ORDER = ["anc", "transparency", "adaptive", "off"]
+
+DEFAULT_CONFIG = {
+    "addr": "",
+    "name": "",
+    "auto_switch_on_playback": True,
+    "disconnect_on_idle": True,
+    "idle_timeout_seconds": 30,
+    "cooldown_after_remote_switch": 45,
+    "default_mode": "anc",
+    "in_ear_detection": True,
+    "pause_on_ear": "both",
+    "adaptive_strength": 50,
+    "adaptive_volume": True,
+    "spatial_enabled": False
+}
+
+def log(msg):
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [PodHop] {msg}", flush=True)
+
+def load_config():
+    cfg = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                user_cfg = json.load(f)
+                cfg.update(user_cfg)
+        except Exception as e:
+            log(f"Warning: could not parse {CONFIG_PATH}: {e}")
+    return cfg
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        log(f"Error saving config: {e}")
+
+def is_bt_connected(addr):
+    if not addr:
+        return False
+    dev_path = f"/org/bluez/hci0/dev_{addr.replace(':', '_')}"
+    try:
+        res = subprocess.run(
+            ["busctl", "get-property", "org.bluez", dev_path, "org.bluez.Device1", "Connected"],
+            capture_output=True, text=True, timeout=1
+        )
+        return "true" in res.stdout.lower()
+    except Exception:
+        return False
+
+def get_bluez_battery(addr):
+    dev_path = f"/org/bluez/hci0/dev_{addr.replace(':', '_')}"
+    try:
+        res = subprocess.run(
+            ["busctl", "get-property", "org.bluez", dev_path, "org.bluez.Battery1", "Percentage"],
+            capture_output=True, text=True, timeout=1
+        )
+        parts = res.stdout.strip().split()
+        if len(parts) >= 2 and parts[0] == "y":
+            return int(parts[1])
+    except Exception:
+        pass
+    return None
+
+def send_notification(title, message, urgency="normal"):
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "AirPods 4 ANC", "-i", "airpods", "-u", urgency, title, message],
+            timeout=2
+        )
+        log(f"[Notification] {title} - {message}")
+    except Exception as e:
+        log(f"Notification error: {e}")
+
+def parse_battery_packet(pkt):
+    if len(pkt) < 7:
+        return None
+    count = pkt[6]
+    if count > 3 or len(pkt) != 7 + 5 * count:
+        return None
+    components = {0x02: "right", 0x04: "left", 0x08: "case"}
+    levels = {}
+    for i in range(count):
+        comp, sp1, pct, status, sp2 = pkt[7 + 5*i : 12 + 5*i]
+        name = components.get(comp)
+        if name:
+            charging = (status == 0x01)
+            connected = (status != 0x04)
+            levels[name] = {
+                "percent": pct if connected else None,
+                "charging": charging,
+                "connected": connected
+            }
+    return levels
+
+class MPRISController:
+    """Quản lý và điều khiển media players toàn hệ thống qua playerctl & MPRIS D-Bus."""
+
+    def __init__(self):
+        self.paused_players = []
+
+    def get_playing_players(self):
+        playing = []
+        try:
+            res = subprocess.run(["playerctl", "-l"], capture_output=True, text=True, timeout=0.6)
+            for p in res.stdout.splitlines():
+                p = p.strip()
+                if p and p != "playerctld":
+                    st = subprocess.run(["playerctl", "-p", p, "status"], capture_output=True, text=True, timeout=0.4).stdout.strip()
+                    if st == "Playing":
+                        playing.append(p)
+        except Exception:
+            pass
+        return playing
+
+    def pause_active_players(self):
+        playing = self.get_playing_players()
+        # 1. Phát lệnh pause toàn bộ hệ thống bằng playerctl
+        try:
+            subprocess.run(["playerctl", "pause", "-a"], capture_output=True, timeout=1.0)
+        except Exception:
+            pass
+
+        # 2. Fallback trực tiếp qua D-Bus cho các app đặc thù
+        try:
+            res = subprocess.run(["busctl", "--user", "list"], capture_output=True, text=True, timeout=0.6)
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if parts and parts[0].startswith("org.mpris.MediaPlayer2."):
+                    p_name = parts[0]
+                    if "playerctld" in p_name:
+                        continue
+                    try:
+                        st_res = subprocess.run(
+                            ["busctl", "--user", "get-property", p_name, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "PlaybackStatus"],
+                            capture_output=True, text=True, timeout=0.5
+                        )
+                        if '"Playing"' in st_res.stdout:
+                            subprocess.run(
+                                ["busctl", "--user", "call", p_name, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "Pause"],
+                                capture_output=True, timeout=0.5
+                            )
+                            short = p_name.removeprefix("org.mpris.MediaPlayer2.")
+                            if short not in playing:
+                                playing.append(short)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        self.paused_players = playing
+        return playing
+
+    def resume_players(self):
+        resumed = []
+        for p in self.paused_players:
+            try:
+                res = subprocess.run(["playerctl", "-p", p, "play"], capture_output=True, timeout=1.0)
+                if res.returncode == 0:
+                    resumed.append(p)
+            except Exception:
+                pass
+        if not resumed and self.paused_players:
+            try:
+                res = subprocess.run(["playerctl", "play"], capture_output=True, timeout=1.0)
+                if res.returncode == 0:
+                    resumed = list(self.paused_players)
+            except Exception:
+                pass
+        self.paused_players = []
+        return resumed
+
+def set_airpods_mute(addr, mute=True):
+    if not addr:
+        return
+    sink_pattern = addr.replace(":", "_")
+    try:
+        res = subprocess.run(["pactl", "list", "sinks", "short"], capture_output=True, text=True, timeout=0.6)
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and sink_pattern in parts[1]:
+                sink_name = parts[1]
+                val = "1" if mute else "0"
+                subprocess.run(["pactl", "set-sink-mute", sink_name, val], capture_output=True, timeout=0.6)
+                log(f"[Audio Sink] {'Mute' if mute else 'Unmute'} tai nghe: {sink_name}")
+                return
+    except Exception as e:
+        log(f"Error setting sink mute: {e}")
+
+class EarDetector:
+    """Phát hiện tháo/đeo tai nghe và điều phối dừng/phát nhạc tức thì."""
+
+    def __init__(self, mpris, addr="", pause_mode="both", enabled=True):
+        self.mpris = mpris
+        self.addr = addr
+        self.pause_mode = pause_mode  # "both" (chỉ ngắt khi tháo cả 2 tai) hoặc "any"
+        self.enabled = enabled
+        self.worn_count = None
+        self.last_primary = None
+        self.last_secondary = None
+        self.paused_by_ear = False
+
+    def reset(self):
+        self.worn_count = None
+        self.last_primary = None
+        self.last_secondary = None
+        self.paused_by_ear = False
+        set_airpods_mute(self.addr, False)
+
+    def update(self, primary_state, secondary_state):
+        self.last_primary = primary_state
+        self.last_secondary = secondary_state
+        buds = [primary_state, secondary_state]
+        worn = buds.count("in")
+        prev = self.worn_count
+        self.worn_count = worn
+
+        if not self.enabled:
+            return None
+
+        if prev is None:
+            # Khởi tạo trạng thái ban đầu khi vừa kết nối
+            if worn == 0:
+                set_airpods_mute(self.addr, True)
+            return None
+
+        if worn == prev:
+            return None
+
+        # 1. THÁO TAI NGHE (số tai đeo giảm: 2->1, 2->0 hoặc 1->0)
+        if worn < prev:
+            should_pause = False
+            if self.pause_mode == "both":
+                should_pause = (worn == 0)
+            else:  # "any"
+                should_pause = (worn < 2)
+
+            if should_pause:
+                paused = self.mpris.pause_active_players()
+                # Khóa âm thanh tai nghe (Mute) để đảm bảo tuyệt đối không phát ra tiếng khi để trên bàn/tay
+                set_airpods_mute(self.addr, True)
+                self.paused_by_ear = True
+                return ("pause", paused or ["media"], worn)
+            else:
+                return ("ignore_single_ear", [], worn)
+
+        # 2. ĐEO LẠI TAI NGHE (số tai đeo tăng: 0->1, 0->2, 1->2)
+        elif worn > prev:
+            # Ở chế độ "both": CHỈ mở tiếng & phát tiếp khi ĐÃ ĐEO LẠI CẢ 2 TAI (worn == 2)
+            # Tránh tuyệt đối việc chạm tay hoặc để trên bàn gây false-positive tự phát nhạc khi chỉ có 1 tai chạm
+            if self.pause_mode == "both":
+                should_resume = (worn == 2)
+            else:
+                should_resume = (worn >= 1)
+
+            if should_resume:
+                set_airpods_mute(self.addr, False)
+                if self.paused_by_ear:
+                    resumed = self.mpris.resume_players()
+                    self.paused_by_ear = False
+                    return ("resume", resumed or ["media"], worn)
+                else:
+                    return ("unmuted", [], worn)
+            else:
+                return ("wait_both_ears", [], worn)
+
+        return None
+
+class PodHopDaemon:
+    def __init__(self):
+        self.running = True
+        self.aap_sock = None
+        self.aap_lock = threading.Lock()
+        self.cooldown_until = 0
+        self.suppress_auto_switch = False
+        self.ignored_stale_streams = set()
+        self.idle_since = None
+        self.was_connected = False
+        self.current_mode = "anc"
+        self.awareness_enabled = False
+        self.cfg = load_config()
+        self.addr = self.cfg.get("addr", "")
+        self.mpris = MPRISController()
+        self.ear_detector = EarDetector(
+            self.mpris,
+            addr=self.addr,
+            pause_mode=self.cfg.get("pause_on_ear", "both"),
+            enabled=self.cfg.get("in_ear_detection", True)
+        )
+        cached_case = self.cfg.get("last_case_battery")
+        self.battery = {
+            "left": {"percent": None, "charging": False, "connected": False},
+            "right": {"percent": None, "charging": False, "connected": False},
+            "case": {"percent": cached_case, "charging": False, "connected": False}
+        }
+        self.ear_state = {"primary": "unknown", "secondary": "unknown", "worn": 0}
+        self.battery_notified_levels = set()
+        self.last_known_min_bat = None
+        self.last_bat_check = 0
+        self.adaptive_strength = self.cfg.get("adaptive_strength", 50)
+        self.adaptive_volume_enabled = self.cfg.get("adaptive_volume", True)
+        self.spatial_enabled = self.cfg.get("spatial_enabled", False)
+
+    def stop(self, *args):
+        log("Stopping PodHop daemon...")
+        self.running = False
+        self.close_aap()
+
+    def connect_aap(self):
+        with self.aap_lock:
+            if self.aap_sock is not None:
+                return True
+            if not is_bt_connected(self.addr):
+                return False
+            try:
+                s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+                s.settimeout(5.0)
+                s.connect((self.addr, PSM))
+                s.sendall(HANDSHAKE)
+                resp = s.recv(64)
+                if not (resp and resp[0] == 0x01):
+                    s.close()
+                    return False
+                s.sendall(SET_FEATURES)
+                resp2 = s.recv(64)
+                s.sendall(REQUEST_NOTIFICATIONS)
+                self.aap_sock = s
+                threading.Thread(target=self.aap_reader_loop, args=(s,), daemon=True).start()
+                log("AAP channel connected with real-time notifications (ear detect, battery, mode).")
+                return True
+            except Exception as e:
+                log(f"AAP connect error: {e}")
+                return False
+
+    def close_aap(self):
+        with self.aap_lock:
+            if self.aap_sock:
+                try:
+                    self.aap_sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.aap_sock.close()
+                except Exception:
+                    pass
+                self.aap_sock = None
+                self.ear_detector.reset()
+
+    def aap_reader_loop(self, s):
+        s.settimeout(1.0)
+        while self.running and self.aap_sock == s:
+            try:
+                pkt = s.recv(1024)
+                if not pkt:
+                    break
+                self.handle_aap_packet(pkt)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running and self.aap_sock == s:
+                    log(f"AAP reader closed: {e}")
+                break
+
+        with self.aap_lock:
+            if self.aap_sock == s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                self.aap_sock = None
+                self.ear_detector.reset()
+                log("AAP channel disconnected.")
+
+    def check_battery_alerts(self):
+        percents = []
+        for side in ("left", "right"):
+            pct = self.battery.get(side, {}).get("percent")
+            charging = self.battery.get(side, {}).get("charging", False)
+            if pct is not None and pct >= 0 and not charging:
+                percents.append(pct)
+
+        if not percents:
+            bz = get_bluez_battery(self.addr)
+            if bz is not None and bz >= 0:
+                percents.append(bz)
+
+        if not percents:
+            return
+
+        min_pct = min(percents)
+        self.last_known_min_bat = min_pct
+
+        # Reset alert thresholds if charging or above 25%
+        if min_pct >= 25:
+            if self.battery_notified_levels:
+                self.battery_notified_levels.clear()
+            return
+
+        # 5% threshold (Critical)
+        if min_pct <= 5 and 5 not in self.battery_notified_levels:
+            self.battery_notified_levels.add(5)
+            self.battery_notified_levels.add(10)
+            self.battery_notified_levels.add(20)
+            send_notification(
+                "⚠️ Pin AirPods sắp cạn (5%)",
+                "Tai nghe chỉ còn 5% pin và sẽ sớm tắt nguồn. Hãy đặt vào hộp sạc ngay.",
+                urgency="critical"
+            )
+        # 10% threshold (Critical)
+        elif min_pct <= 10 and 10 not in self.battery_notified_levels:
+            self.battery_notified_levels.add(10)
+            self.battery_notified_levels.add(20)
+            send_notification(
+                "⚠️ Pin AirPods rất yếu (10%)",
+                f"Pin tai nghe còn {min_pct}%. Vui lòng đặt vào hộp sạc để tiếp tục sử dụng.",
+                urgency="critical"
+            )
+        # 20% threshold (Normal)
+        elif min_pct <= 20 and 20 not in self.battery_notified_levels:
+            self.battery_notified_levels.add(20)
+            send_notification(
+                "🪫 Pin AirPods yếu (20%)",
+                f"Tai nghe còn {min_pct}% pin. Bạn nên sạc sớm để tránh bị ngắt quãng.",
+                urgency="normal"
+            )
+
+    def handle_aap_packet(self, pkt):
+        # 1. In-Ear detection packet
+        if pkt.startswith(PKT_EAR) and len(pkt) >= 8:
+            prim_st = EAR_STATES.get(pkt[6], "gone")
+            sec_st = EAR_STATES.get(pkt[7], "gone")
+            self.ear_state["primary"] = prim_st
+            self.ear_state["secondary"] = sec_st
+            self.ear_state["worn"] = [prim_st, sec_st].count("in")
+
+            res = self.ear_detector.update(prim_st, sec_st)
+            if res:
+                action, players, worn = res
+                short_players = [p.removeprefix("org.mpris.MediaPlayer2.").split(".")[0] for p in players]
+                if action == "pause":
+                    log(f"[In-Ear] Đã tháo cả 2 tai nghe (còn 0 tai) -> Tạm dừng media & Mute tai nghe: {', '.join(short_players) or 'Đã dừng'}")
+                elif action == "resume":
+                    log(f"[In-Ear] Đã đeo lại cả 2 tai nghe ({prim_st}/{sec_st}) -> Unmute & Tiếp tục phát: {', '.join(short_players) or 'Đã phát'}")
+                elif action == "ignore_single_ear":
+                    log(f"[In-Ear] Tháo 1 tai ({prim_st}/{sec_st}, vẫn còn {worn} tai) -> Tiếp tục phát nhạc (Chế độ: Tháo cả 2 tai mới ngắt)")
+                elif action == "wait_both_ears":
+                    log(f"[In-Ear] Phát hiện 1 tai chạm ({prim_st}/{sec_st}, {worn} tai) -> Chưa đủ 2 tai, giữ nguyên trạng thái Dừng & Mute")
+                elif action == "unmuted":
+                    log(f"[In-Ear] Đã đeo cả 2 tai nghe -> Unmute tai nghe")
+            else:
+                log(f"[In-Ear Sensor] Cảm biến tai nghe: Tai chính={prim_st}, Tai phụ={sec_st} (Số tai đang đeo: {self.ear_state['worn']})")
+
+        # 2. Battery status packet
+        elif pkt.startswith(PKT_BATTERY):
+            levels = parse_battery_packet(pkt)
+            if levels:
+                for k, v in levels.items():
+                    if k == "case":
+                        if v.get("connected") and v.get("percent") is not None:
+                            self.battery["case"] = v
+                            self.cfg["last_case_battery"] = v["percent"]
+                            save_config(self.cfg)
+                            log(f"[PodHop] Cập nhật pin hộp sạc: {v['percent']}% (Sạc: {v.get('charging', False)})")
+                        else:
+                            # Hộp đang đóng nắp (0x04)
+                            self.battery["case"]["connected"] = False
+                            self.battery["case"]["charging"] = v.get("charging", False)
+                            # Giữ lại mức pin đã lưu từ lần mở nắp gần nhất
+                            if self.battery["case"].get("percent") is None:
+                                self.battery["case"]["percent"] = self.cfg.get("last_case_battery")
+                    else:
+                        self.battery[k] = v
+                self.check_battery_alerts()
+
+        # 3. Noise Mode packet (stem squeeze or change from other device)
+        elif pkt.startswith(PKT_NOISE) and len(pkt) > 7:
+            mode = NOISE_MAP.get(pkt[7])
+            if mode and mode != self.current_mode:
+                self.current_mode = mode
+                log(f"[PodHop] Noise control mode synced from AirPods: {mode}")
+
+        # 4. Awareness packet
+        elif pkt.startswith(PKT_AWARENESS) and len(pkt) > 7:
+            aware = (pkt[7] == 0x01)
+            if aware != self.awareness_enabled:
+                self.awareness_enabled = aware
+                log(f"[PodHop] Conversational awareness synced: {'Bật' if aware else 'Tắt'}")
+
+        # 5. AutoANC Strength packet
+        elif pkt.startswith(bytes.fromhex("0400040009002e")) and len(pkt) > 7:
+            val = pkt[7]
+            if val != self.adaptive_strength:
+                self.adaptive_strength = val
+                log(f"[PodHop] Adaptive strength synced from AirPods: {val}%")
+
+        # 6. Adaptive Volume packet
+        elif pkt.startswith(bytes.fromhex("04000400090026")) and len(pkt) > 7:
+            val = (pkt[7] == 0x01)
+            if val != self.adaptive_volume_enabled:
+                self.adaptive_volume_enabled = val
+                log(f"[PodHop] Adaptive volume synced: {'Bật' if val else 'Tắt'}")
+
+    def send_aap_packet(self, pkt):
+        with self.aap_lock:
+            if not self.aap_sock:
+                if not is_bt_connected(self.addr):
+                    return False, "AirPods chưa kết nối với máy tính"
+                try:
+                    s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+                    s.settimeout(5.0)
+                    s.connect((self.addr, PSM))
+                    s.sendall(HANDSHAKE)
+                    resp = s.recv(64)
+                    if not (resp and resp[0] == 0x01):
+                        s.close()
+                        return False, "Handshake failed"
+                    s.sendall(SET_FEATURES)
+                    resp2 = s.recv(64)
+                    s.sendall(REQUEST_NOTIFICATIONS)
+                    self.aap_sock = s
+                    threading.Thread(target=self.aap_reader_loop, args=(s,), daemon=True).start()
+                except Exception as e:
+                    return False, str(e)
+
+            try:
+                self.aap_sock.sendall(pkt)
+                return True, "OK"
+            except Exception as e:
+                log(f"Lỗi gửi AAP packet: {e}")
+                try:
+                    self.aap_sock.close()
+                except Exception:
+                    pass
+                self.aap_sock = None
+                return False, str(e)
+
+    def set_noise_mode(self, mode_name):
+        pkt = MODE_PACKETS.get(mode_name.lower())
+        if not pkt:
+            return False, f"Chế độ không hợp lệ: {mode_name}"
+        ok, res = self.send_aap_packet(pkt)
+        if ok:
+            self.current_mode = mode_name.lower()
+            log(f"Noise control mode switched to: {self.current_mode}")
+            return True, self.current_mode
+        return False, res
+
+    def set_awareness(self, enabled):
+        pkt = AWARENESS_PACKETS.get(bool(enabled))
+        ok, res = self.send_aap_packet(pkt)
+        if ok:
+            self.awareness_enabled = bool(enabled)
+            st = "Bật" if self.awareness_enabled else "Tắt"
+            log(f"Conversational Awareness: {st}")
+            return True, st
+        return False, res
+
+    def set_adaptive_strength(self, val):
+        val = max(0, min(100, int(val)))
+        pkt = bytes.fromhex(f"0400040009002e{val:02x}000000")
+        ok, res = self.send_aap_packet(pkt)
+        if ok:
+            self.adaptive_strength = val
+            self.cfg["adaptive_strength"] = val
+            save_config(self.cfg)
+            log(f"Adaptive Audio Strength: {val}%")
+            return True, str(val)
+        return False, res
+
+    def set_adaptive_volume(self, enabled):
+        byte_val = "01" if enabled else "02"
+        pkt = bytes.fromhex(f"04000400090026{byte_val}000000")
+        ok, res = self.send_aap_packet(pkt)
+        if ok:
+            self.adaptive_volume_enabled = bool(enabled)
+            self.cfg["adaptive_volume"] = bool(enabled)
+            save_config(self.cfg)
+            st = "Bật" if self.adaptive_volume_enabled else "Tắt"
+            log(f"Adaptive Volume: {st}")
+            return True, st
+        return False, res
+
+    def set_spatial(self, enabled):
+        bt_sink = f"bluez_output.{self.addr.replace(':', '_')}.1"
+        target_sink = "effect_input.airpods_spatial" if enabled else bt_sink
+        try:
+            subprocess.run(["pactl", "set-default-sink", target_sink], capture_output=True, timeout=1)
+            res = subprocess.run(["pactl", "list", "sink-inputs", "short"], capture_output=True, text=True, timeout=1)
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if parts:
+                    input_id = parts[0]
+                    subprocess.run(["pactl", "move-sink-input", input_id, target_sink], capture_output=True, timeout=1)
+            self.spatial_enabled = bool(enabled)
+            self.cfg["spatial_enabled"] = bool(enabled)
+            save_config(self.cfg)
+            st = "Bật" if self.spatial_enabled else "Tắt"
+            log(f"Spatial Audio 3D: {st}")
+            return True, st
+        except Exception as e:
+            return False, str(e)
+
+    def aap_takeover(self, addr):
+        log(f"Paging {addr} on L2CAP PSM 0x{PSM:04X} (stealing from iPhone)...")
+        self.close_aap()
+        s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+        s.settimeout(12.0)
+        try:
+            t0 = time.time()
+            s.connect((addr, PSM))
+            s.sendall(HANDSHAKE)
+            resp = s.recv(64)
+            elapsed = time.time() - t0
+            if resp and resp[0] == 0x01:
+                log(f"AAP takeover succeeded in {elapsed:.1f}s! ACK: {resp[:10].hex()}...")
+                s.sendall(SET_FEATURES)
+                resp2 = s.recv(64)
+                s.sendall(REQUEST_NOTIFICATIONS)
+                with self.aap_lock:
+                    self.aap_sock = s
+                threading.Thread(target=self.aap_reader_loop, args=(s,), daemon=True).start()
+
+                dev_path = f"/org/bluez/hci0/dev_{addr.replace(':', '_')}"
+                def async_connect_a2dp():
+                    subprocess.run(
+                        ["busctl", "call", "org.bluez", dev_path, "org.bluez.Device1", "ConnectProfile", "s", A2DP_SINK_UUID],
+                        capture_output=True, timeout=2
+                    )
+                threading.Thread(target=async_connect_a2dp, daemon=True).start()
+                return True
+            else:
+                log(f"AAP handshake failed: {resp.hex() if resp else 'None'}")
+                s.close()
+                return False
+        except Exception as e:
+            log(f"Takeover error: {e}")
+            try:
+                s.close()
+            except Exception:
+                pass
+            return False
+
+    def release_airpods(self, addr):
+        log(f"Releasing AirPods {addr} to let iPhone connect...")
+        self.close_aap()
+        try:
+            subprocess.run(["bluetoothctl", "disconnect", addr], capture_output=True, timeout=3)
+            log("AirPods released.")
+        except Exception as e:
+            log(f"Error releasing: {e}")
+
+    def manual_takeover(self):
+        log("Manual takeover requested via IPC...")
+        self.cooldown_until = 0
+        self.suppress_auto_switch = False
+        self.ignored_stale_streams.clear()
+        ok = self.aap_takeover(self.addr)
+        if ok:
+            self.was_connected = True
+            return True
+        return False
+
+    def manual_release(self):
+        log("Manual release requested via IPC...")
+        now = time.time()
+        self.cooldown_until = now + 120.0
+        self.suppress_auto_switch = True
+        playing, active_streams = self.check_audio_playback()
+        self.ignored_stale_streams = set(active_streams)
+
+        # Pause active media on Linux so laptop speakers do not blast
+        try:
+            self.mpris.pause_active_players()
+        except Exception:
+            pass
+
+        self.close_aap()
+        self.release_airpods(self.addr)
+        self.was_connected = False
+        self.idle_since = None
+        log("AirPods released to iPhone. Auto-takeover blocked for 120s.")
+        return True
+
+    def handle_ipc(self, msg):
+        parts = msg.strip().split()
+        if not parts:
+            return "ERR: empty command"
+        cmd = parts[0].lower()
+        if cmd == "mode":
+            sub = parts[1].lower() if len(parts) > 1 else "cycle"
+            if sub == "cycle":
+                try:
+                    curr_idx = MODE_ORDER.index(self.current_mode)
+                    next_idx = (curr_idx + 1) % len(MODE_ORDER)
+                except ValueError:
+                    next_idx = 0
+                sub = MODE_ORDER[next_idx]
+            ok, res = self.set_noise_mode(sub)
+            return f"OK {res}" if ok else f"ERR {res}"
+        elif cmd == "awareness":
+            sub = parts[1].lower() if len(parts) > 1 else "toggle"
+            val = (sub == "on") if sub in ("on", "off") else (not self.awareness_enabled)
+            ok, res = self.set_awareness(val)
+            return f"OK {res}" if ok else f"ERR {res}"
+        elif cmd == "adaptive_strength":
+            sub = parts[1].lower() if len(parts) > 1 else "default"
+            strength_map = {
+                "more_noise": 0, "more": 0, "min": 0,
+                "default": 50, "normal": 50, "mid": 50,
+                "less_noise": 100, "less": 100, "max": 100
+            }
+            if sub in strength_map:
+                val = strength_map[sub]
+            else:
+                try:
+                    val = int(sub)
+                except ValueError:
+                    val = 50
+            ok, res = self.set_adaptive_strength(val)
+            return f"OK {res}" if ok else f"ERR {res}"
+        elif cmd == "adaptive_volume":
+            sub = parts[1].lower() if len(parts) > 1 else "toggle"
+            val = (sub == "on") if sub in ("on", "off") else (not self.adaptive_volume_enabled)
+            ok, res = self.set_adaptive_volume(val)
+            return f"OK {res}" if ok else f"ERR {res}"
+        elif cmd == "spatial":
+            sub = parts[1].lower() if len(parts) > 1 else "toggle"
+            val = (sub == "on") if sub in ("on", "off") else (not self.spatial_enabled)
+            ok, res = self.set_spatial(val)
+            return f"OK {res}" if ok else f"ERR {res}"
+        elif cmd == "ear":
+            sub = parts[1].lower() if len(parts) > 1 else "toggle"
+            val = (sub == "on") if sub in ("on", "off") else (not self.ear_detector.enabled)
+            self.ear_detector.enabled = val
+            self.cfg["in_ear_detection"] = val
+            save_config(self.cfg)
+            st = "Bật" if val else "Tắt"
+            log(f"In-Ear Detection: {st}")
+            return f"OK {st}"
+        elif cmd == "ear_mode":
+            sub = parts[1].lower() if len(parts) > 1 else "any"
+            if sub in ("any", "both"):
+                self.ear_detector.pause_mode = sub
+                self.cfg["pause_on_ear"] = sub
+                save_config(self.cfg)
+                log(f"In-Ear Pause Mode: {sub}")
+                return f"OK {sub}"
+            return "ERR: invalid ear_mode (use 'any' or 'both')"
+        elif cmd == "idle_release":
+            sub = parts[1].lower() if len(parts) > 1 else "toggle"
+            val = (sub == "on") if sub in ("on", "off") else (not self.cfg.get("disconnect_on_idle", True))
+            self.cfg["disconnect_on_idle"] = val
+            save_config(self.cfg)
+            st = "Bật" if val else "Tắt"
+            log(f"Auto-release on idle: {st}")
+            return f"OK {st}"
+        elif cmd == "switch":
+            ok = self.manual_takeover()
+            return "OK connected" if ok else "ERR takeover_failed"
+        elif cmd == "release":
+            ok = self.manual_release()
+            return f"OK {ok}"
+        elif cmd == "get_mode":
+            return f"OK {self.current_mode}"
+        elif cmd == "status":
+            conn = "connected" if is_bt_connected(self.addr) else "disconnected"
+            aware = "1" if self.awareness_enabled else "0"
+            ear_on = "1" if self.ear_detector.enabled else "0"
+            ear_mode = self.ear_detector.pause_mode
+            bl = self.battery.get("left", {}).get("percent")
+            bl_str = str(bl) if bl is not None else "-1"
+            br = self.battery.get("right", {}).get("percent")
+            br_str = str(br) if br is not None else "-1"
+            bc = self.battery.get("case", {}).get("percent")
+            bc_str = str(bc) if bc is not None else "-1"
+            bcase_conn = "1" if self.battery.get("case", {}).get("connected") else "0"
+            chg_l = "1" if self.battery.get("left", {}).get("charging") else "0"
+            chg_r = "1" if self.battery.get("right", {}).get("charging") else "0"
+            chg_c = "1" if self.battery.get("case", {}).get("charging") else "0"
+            bz_bat = get_bluez_battery(self.addr) if conn == "connected" else None
+            bz_str = str(bz_bat) if bz_bat is not None else "-1"
+            prim = self.ear_state.get("primary", "unknown")
+            sec = self.ear_state.get("secondary", "unknown")
+            adapt_vol = "1" if self.adaptive_volume_enabled else "0"
+            spatial_st = "1" if self.spatial_enabled else "0"
+            idle_rel = "1" if self.cfg.get("disconnect_on_idle", True) else "0"
+            return f"OK status={conn} mode={self.current_mode} awareness={aware} in_ear={ear_on} ear_mode={ear_mode} ear_prim={prim} ear_sec={sec} bat_l={bl_str} bat_r={br_str} bat_c={bc_str} bat_c_conn={bcase_conn} bat_main={bz_str} chg_l={chg_l} chg_r={chg_r} chg_c={chg_c} adapt_str={self.adaptive_strength} adapt_vol={adapt_vol} spatial={spatial_st} idle_rel={idle_rel}"
+        return "ERR: unknown command"
+
+    def ipc_worker(self):
+        if os.path.exists(UNIX_SOCK_PATH):
+            try:
+                os.unlink(UNIX_SOCK_PATH)
+            except OSError:
+                pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(UNIX_SOCK_PATH)
+            server.listen(5)
+            server.settimeout(0.5)
+            while self.running:
+                try:
+                    conn, _ = server.accept()
+                    conn.settimeout(2.0)
+                    try:
+                        req = conn.recv(1024).decode().strip()
+                        if req:
+                            resp = self.handle_ipc(req)
+                            conn.sendall((resp + "\n").encode())
+                    except Exception:
+                        pass
+                    finally:
+                        conn.close()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    pass
+        finally:
+            server.close()
+            if os.path.exists(UNIX_SOCK_PATH):
+                try:
+                    os.unlink(UNIX_SOCK_PATH)
+                except OSError:
+                    pass
+
+    def get_active_user_streams(self):
+        """Returns a set of active real user audio streams (e.g. Firefox, Spotify, VLC).
+        Filters out virtual nodes (spatial audio), loopbacks, system alerts, and muted/corked streams.
+        """
+        active_streams = set()
+        try:
+            res = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True, text=True, timeout=1)
+            if not res.stdout:
+                return active_streams
+            blocks = res.stdout.split("Sink Input #")
+            for b in blocks[1:]:
+                # Ignore muted or corked streams
+                if "Corked: yes" in b or "Mute: yes" in b:
+                    continue
+                if "Corked: no" not in b:
+                    continue
+
+                # Ignore virtual nodes and filter chains
+                if 'node.virtual = "true"' in b:
+                    continue
+                if any(x in b for x in ('node.name = "effect_', 'node.name = "filter-chain', 'node.name = "loopback', 'media.name = "AirPods Spatial')):
+                    continue
+
+                # Ignore system event / alert sounds
+                if 'media.role = "event"' in b or 'media.role = "alert"' in b:
+                    continue
+
+                # Identify the application
+                app_name = ""
+                for line in b.splitlines():
+                    line = line.strip()
+                    if line.startswith("application.name ="):
+                        app_name = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("application.process.binary =") and not app_name:
+                        app_name = line.split("=", 1)[1].strip().strip('"')
+
+                if not app_name:
+                    continue
+
+                # Unique stream key: AppName + SinkInputID
+                stream_id = b.splitlines()[0].strip()
+                active_streams.add(f"{app_name}#{stream_id}")
+        except Exception:
+            pass
+        return active_streams
+
+    def check_audio_playback(self):
+        active = self.get_active_user_streams()
+        return (len(active) > 0), active
+
+    def run(self):
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+
+        addr = self.addr
+        if not addr:
+            log("No AirPods address configured! Run 'podhop discover' first.")
+            sys.exit(1)
+
+        log(f"Starting High-Speed PodHop daemon for AirPods: {addr}")
+
+        # Start IPC Server
+        ipc_thread = threading.Thread(target=self.ipc_worker, daemon=True)
+        ipc_thread.start()
+
+        # Start pactl subscribe listener
+        event_trigger = threading.Event()
+        def audio_listener():
+            while self.running:
+                try:
+                    proc = subprocess.Popen(["stdbuf", "-oL", "pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+                    for line in iter(proc.stdout.readline, ""):
+                        if not self.running:
+                            break
+                        if "sink-input" in line:
+                            event_trigger.set()
+                except Exception:
+                    time.sleep(1)
+                finally:
+                    if 'proc' in locals():
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+
+        listener_thread = threading.Thread(target=audio_listener, daemon=True)
+        listener_thread.start()
+
+        self.was_connected = is_bt_connected(addr)
+        if self.was_connected:
+            self.connect_aap()
+
+        while self.running:
+            event_trigger.wait(timeout=0.5)
+            event_trigger.clear()
+
+            now = time.time()
+            playing, active_streams = self.check_audio_playback()
+            connected = is_bt_connected(addr)
+
+            # State transition: Newly connected
+            if not self.was_connected and connected:
+                log("AirPods connected to Linux.")
+                self.idle_since = now
+                self.cooldown_until = 0
+                self.suppress_auto_switch = False
+                self.ignored_stale_streams.clear()
+                if self.aap_sock is None:
+                    self.connect_aap()
+
+            # State transition: Disconnected (iPhone took over, or user released, or connection lost)
+            elif self.was_connected and not connected:
+                # Check if disconnected due to exhausted battery
+                if self.last_known_min_bat is not None and self.last_known_min_bat <= 10:
+                    send_notification(
+                        "🔴 AirPods đã hết pin",
+                        f"Tai nghe đã ngắt kết nối do cạn pin (mức pin cuối: {self.last_known_min_bat}%). Vui lòng đặt vào hộp để sạc lại.",
+                        urgency="critical"
+                    )
+                self.last_known_min_bat = None
+                cooldown = self.cfg.get("cooldown_after_remote_switch", 45)
+                self.cooldown_until = now + cooldown
+                self.suppress_auto_switch = True
+                self.ignored_stale_streams = set(active_streams)
+                if playing:
+                    log(f"AirPods disconnected while audio was playing on PC (iPhone connected). Cooldown active for {cooldown}s. Existing streams ignored: {', '.join(active_streams)}")
+                else:
+                    log(f"AirPods disconnected from PC (iPhone connected or idle release). Cooldown active for {cooldown}s.")
+                self.close_aap()
+                self.idle_since = None
+
+            self.was_connected = connected
+
+            # Periodic battery alert check when connected
+            if now - getattr(self, 'last_trim', 0) > 30.0:
+                self.last_trim = now
+                trim_memory()
+
+            if connected and (now - self.last_bat_check > 8.0):
+                self.last_bat_check = now
+                self.check_battery_alerts()
+
+            # If connected via Bluetooth but AAP not yet up, try to connect (only when not in cooldown)
+            if connected and self.aap_sock is None and now >= self.cooldown_until:
+                self.connect_aap()
+
+            # Reset stale streams suppression once all audio on Linux stops
+            if not playing:
+                if self.ignored_stale_streams or self.suppress_auto_switch:
+                    self.ignored_stale_streams.clear()
+                    self.suppress_auto_switch = False
+
+            # Logic 1: Audio playing on Linux
+            if playing:
+                self.idle_since = None
+                if not connected:
+                    # Only trigger auto-switch if:
+                    # 1. Config allows auto_switch_on_playback
+                    # 2. Cooldown period has expired (now >= cooldown_until)
+                    # 3. There is a BRAND NEW audio stream (not a stale stream that was active during disconnect)
+                    # 4. Auto switch is not explicitly suppressed
+                    new_streams = active_streams - self.ignored_stale_streams
+                    if (self.cfg.get("auto_switch_on_playback", True)
+                            and not self.suppress_auto_switch
+                            and len(new_streams) > 0
+                            and now >= self.cooldown_until):
+                        log(f"New audio playback on Linux ({', '.join(new_streams)})! Pulling AirPods from iPhone...")
+                        ok = self.aap_takeover(addr)
+                        if ok:
+                            self.was_connected = True
+                            self.idle_since = now
+                        else:
+                            # Back off 15s if takeover failed (e.g. host is sleeping or in case)
+                            self.cooldown_until = now + 15.0
+
+            # Logic 2: Audio idle on Linux
+            else:
+                if not connected:
+                    self.idle_since = None
+                else:
+                    if self.idle_since is None:
+                        self.idle_since = now
+                    idle_duration = now - self.idle_since
+                    if self.cfg.get("disconnect_on_idle", True):
+                        timeout = self.cfg.get("idle_timeout_seconds", 30)
+                        if idle_duration >= timeout:
+                            log(f"No audio playback on Linux for {int(idle_duration)}s. Releasing AirPods to iPhone.")
+                            self.close_aap()
+                            self.release_airpods(addr)
+                            self.was_connected = False
+                            self.idle_since = None
+                            self.cooldown_until = now + 15.0
+
+        log("PodHop daemon exited.")
+
+if __name__ == "__main__":
+    daemon = PodHopDaemon()
+    daemon.run()

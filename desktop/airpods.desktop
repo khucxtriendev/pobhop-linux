@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=AirPods 4 ANC Manager
+GenericName=AirPods Controller
+Comment=Quản lý và điều khiển AirPods 4 ANC trên Linux
+Exec=/usr/local/bin/airpods
+Icon=airpods
+Terminal=false
+Type=Application
+StartupNotify=true
+StartupWMClass=airpods
+Categories=AudioVideo;Audio;Qt;
+Keywords=airpods;apple;anc;transparency;bluetooth;iphone;audio;headphones;
+X-KDE-SubstituteUID=false

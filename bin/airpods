@@ -1,0 +1,1319 @@
+#!/usr/bin/env python3
+"""PodHop GUI — Trình điều khiển AirPods 4 ANC cao cấp cho Linux.
+
+Thiết kế chuẩn Apple Design Guidelines (macOS Control Center / iOS 18):
+- Kích thước siêu gọn nhẹ (400x615px), vừa vặn mọi màn hình laptop.
+- Trình phát đa phương tiện (Now Playing Media Player) tương thích mọi ứng dụng Linux qua MPRIS.
+- Segmented Control 4 chế độ chống ồn chuẩn Apple Sound Control.
+- Nhóm cài đặt thông minh phong cách iOS Settings Grouped Table.
+- Chế độ Sáng / Tối tự động theo hệ thống hoặc chuyển đổi thủ công.
+- Hỗ trợ màn hình HiDPI / Retina (DPR 2.0x) sắc nét từng pixel.
+- Chạy ngầm êm ái, cơ chế Single-Instance không trùng lặp tiến trình.
+"""
+
+import codecs
+import ctypes
+import gc
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+try:
+    libc = ctypes.CDLL('libc.so.6')
+    if hasattr(libc, 'mallopt'):
+        libc.mallopt(-1, 65536)  # M_TRIM_THRESHOLD = 64KB
+except Exception:
+    libc = None
+
+
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, Property, QPropertyAnimation, QEasingCurve, QByteArray, QSize, QRectF
+from PySide6.QtGui import QFont, QIcon, QPixmap, QGuiApplication, QPainter, QColor, QPainterPath, QFontMetrics, QKeySequence, QShortcut
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QPushButton, QFrame, QAbstractButton, QSizePolicy
+)
+
+CONFIG_PATH = os.path.expanduser("~/.config/podhop.json")
+UNIX_SOCK_PATH = f"/run/user/{os.getuid()}/podhop.sock"
+GUI_SOCK_PATH = f"/run/user/{os.getuid()}/podhop_gui.sock"
+ICONS_DIR = "/opt/podhop/icons"
+
+def get_dpr():
+    screen = QGuiApplication.primaryScreen()
+    return screen.devicePixelRatio() if screen else 2.0
+
+_PIXMAP_CACHE = {}
+
+def load_tinted_pixmap(icon_name, color_hex, size=(16, 16)):
+    dpr = get_dpr()
+    cache_key = (icon_name, color_hex, size, dpr)
+    if cache_key in _PIXMAP_CACHE:
+        return _PIXMAP_CACHE[cache_key]
+
+    svg_path = os.path.join(ICONS_DIR, f"{icon_name}.svg")
+    if not os.path.exists(svg_path):
+        return QPixmap()
+    try:
+        with open(svg_path, "r") as f:
+            content = f.read()
+        content = content.replace('stroke="#0F172A"', f'stroke="{color_hex}"')
+        content = content.replace('stroke="currentColor"', f'stroke="{color_hex}"')
+        content = content.replace('fill="currentColor"', f'fill="{color_hex}"')
+        content = content.replace('stroke-width="1.5"', 'stroke-width="1.8"')
+
+        dpr = get_dpr()
+        renderer = QSvgRenderer(QByteArray(content.encode()))
+        phys_w = int(size[0] * dpr)
+        phys_h = int(size[1] * dpr)
+        pixmap = QPixmap(phys_w, phys_h)
+        pixmap.setDevicePixelRatio(dpr)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        renderer.render(painter, QRectF(0, 0, size[0], size[1]))
+        painter.end()
+        _PIXMAP_CACHE[cache_key] = pixmap
+        return pixmap
+    except Exception:
+        return QPixmap()
+
+def load_tinted_icon(icon_name, color_hex, size=(16, 16)):
+    pm = load_tinted_pixmap(icon_name, color_hex, size)
+    icon = QIcon()
+    icon.addPixmap(pm)
+    return icon
+
+def send_daemon_cmd(cmd):
+    if not os.path.exists(UNIX_SOCK_PATH):
+        return None
+    try:
+        to = 15.0 if cmd.startswith("switch") else 2.5
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(to)
+            s.connect(UNIX_SOCK_PATH)
+            s.sendall((cmd + "\n").encode())
+            resp = s.recv(1024).decode().strip()
+            return resp
+    except Exception:
+        return None
+
+def try_raise_existing_instance():
+    """Kiểm tra xem app đã chạy ngầm chưa. Nếu có, gửi tín hiệu hiện cửa sổ."""
+    if not os.path.exists(GUI_SOCK_PATH):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.8)
+            s.connect(GUI_SOCK_PATH)
+            s.sendall(b"SHOW\n")
+            resp = s.recv(64).decode().strip()
+            return resp == "OK"
+    except Exception:
+        try:
+            os.unlink(GUI_SOCK_PATH)
+        except OSError:
+            pass
+        return False
+
+def get_system_theme():
+    try:
+        scheme = QGuiApplication.styleHints().colorScheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return "dark"
+        elif scheme == Qt.ColorScheme.Light:
+            return "light"
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["busctl", "--user", "call", "org.freedesktop.portal.Desktop",
+             "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings",
+             "Read", "ss", "org.freedesktop.appearance", "color-scheme"],
+            capture_output=True, text=True, timeout=1
+        )
+        if "u 1" in res.stdout:
+            return "dark"
+        elif "u 2" in res.stdout:
+            return "light"
+    except Exception:
+        pass
+    return "dark"
+
+class MediaController:
+    """Điều khiển phát nhạc toàn hệ thống qua chuẩn D-Bus MPRIS & playerctl."""
+    def __init__(self):
+        self.cached_player = None
+
+    def get_media_info(self):
+        try:
+            res = subprocess.run(
+                ["playerctl", "metadata", "--format", "{{status}}:::{{playerName}}:::{{title}}:::{{artist}}:::{{mpris:artUrl}}"],
+                capture_output=True, text=True, timeout=0.4
+            )
+            out = res.stdout.strip()
+            if out and ":::" in out:
+                parts = out.split(":::", 4)
+                status = parts[0].strip() or "Stopped"
+                player = parts[1].strip() or "Media"
+                title = parts[2].strip() or "Không có tiêu đề"
+                artist = parts[3].strip() or player.capitalize()
+                art_url = parts[4].strip().replace("file://", "") if len(parts) > 4 else ""
+                return f"org.mpris.MediaPlayer2.{player}", status, {
+                    "title": title,
+                    "artist": artist,
+                    "art_url": art_url,
+                    "app_name": player.capitalize()
+                }
+        except Exception:
+            pass
+        player, status = self.get_active_player()
+        meta = self.get_metadata(player)
+        return player, status, meta
+
+    def get_active_player(self):
+        # 1. Try playerctl
+        try:
+            res = subprocess.run(["playerctl", "-l"], capture_output=True, text=True, timeout=0.6)
+            plist = [p.strip() for p in res.stdout.splitlines() if p.strip()]
+            for p in plist:
+                st_res = subprocess.run(["playerctl", "-p", p, "status"], capture_output=True, text=True, timeout=0.4)
+                st = st_res.stdout.strip()
+                if st == "Playing":
+                    return f"org.mpris.MediaPlayer2.{p}", "Playing"
+            for p in plist:
+                st_res = subprocess.run(["playerctl", "-p", p, "status"], capture_output=True, text=True, timeout=0.4)
+                st = st_res.stdout.strip()
+                if st == "Paused":
+                    return f"org.mpris.MediaPlayer2.{p}", "Paused"
+        except Exception:
+            pass
+
+        # 2. Fallback to busctl
+        try:
+            res = subprocess.run(["busctl", "--user", "list"], capture_output=True, text=True, timeout=0.6)
+            players = [line.split()[0] for line in res.stdout.splitlines() if line.split() and line.split()[0].startswith("org.mpris.MediaPlayer2.")]
+            if not players:
+                return None, "Stopped"
+            
+            for p in players:
+                st = self.get_player_status(p)
+                if st == "Playing":
+                    self.cached_player = p
+                    return p, st
+            
+            for p in players:
+                st = self.get_player_status(p)
+                if st == "Paused":
+                    self.cached_player = p
+                    return p, st
+            
+            return players[0], "Stopped"
+        except Exception:
+            return None, "Stopped"
+
+    def get_player_status(self, player):
+        try:
+            res = subprocess.run(
+                ["busctl", "--user", "get-property", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "PlaybackStatus"],
+                capture_output=True, text=True, timeout=0.5
+            )
+            out = res.stdout.strip().replace('"', '').replace('s ', '')
+            return out or "Stopped"
+        except Exception:
+            return "Stopped"
+
+    def get_metadata(self, player):
+        if not player:
+            return {
+                "title": "Không có bài hát đang phát",
+                "artist": "Mở trình duyệt hoặc ứng dụng nhạc",
+                "art_url": "",
+                "app_name": "Media"
+            }
+        try:
+            res = subprocess.run(
+                ["busctl", "--user", "get-property", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "Metadata"],
+                capture_output=True, text=True, timeout=0.8
+            )
+            meta_str = res.stdout
+
+            def decode_val(s):
+                try:
+                    return codecs.escape_decode(s.encode("latin1"))[0].decode("utf-8")
+                except Exception:
+                    return s
+
+            title = ""
+            m_title = re.search(r'"xesam:title"\s+s\s+"([^"]+)"', meta_str)
+            if m_title:
+                title = decode_val(m_title.group(1))
+
+            artist = ""
+            m_artist = re.search(r'"xesam:artist"\s+as\s+\d+\s+"([^"]+)"', meta_str)
+            if m_artist:
+                artist = decode_val(m_artist.group(1))
+
+            art_url = ""
+            m_art = re.search(r'"mpris:artUrl"\s+s\s+"([^"]+)"', meta_str)
+            if m_art:
+                art_url = m_art.group(1).replace("file://", "")
+
+            app_name = player.removeprefix("org.mpris.MediaPlayer2.").split(".")[0].capitalize()
+            return {
+                "title": title or "Không có tiêu đề",
+                "artist": artist or app_name,
+                "art_url": art_url,
+                "app_name": app_name
+            }
+        except Exception:
+            return {
+                "title": "Không có bài hát đang phát",
+                "artist": "Chưa có trình phát nào",
+                "art_url": "",
+                "app_name": "Media"
+            }
+
+    def play_pause(self):
+        player, st = self.get_active_player()
+        # 1. Try playerctl
+        try:
+            if st == "Playing":
+                res = subprocess.run(["playerctl", "pause"], capture_output=True, timeout=1)
+                if res.returncode == 0:
+                    return
+            elif st in ("Paused", "Stopped"):
+                res = subprocess.run(["playerctl", "play"], capture_output=True, timeout=1)
+                if res.returncode == 0:
+                    return
+            res = subprocess.run(["playerctl", "play-pause"], capture_output=True, timeout=1)
+            if res.returncode == 0:
+                return
+        except Exception:
+            pass
+
+        # 2. Fallback to busctl
+        if player:
+            target_method = "Pause" if st == "Playing" else "Play"
+            try:
+                subprocess.run(
+                    ["busctl", "--user", "call", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", target_method],
+                    capture_output=True, timeout=1
+                )
+            except Exception:
+                try:
+                    subprocess.run(
+                        ["busctl", "--user", "call", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "PlayPause"],
+                        capture_output=True, timeout=1
+                    )
+                except Exception:
+                    pass
+
+    def next_track(self):
+        try:
+            res = subprocess.run(["playerctl", "next"], capture_output=True, timeout=1)
+            if res.returncode == 0:
+                return
+        except Exception:
+            pass
+        player, _ = self.get_active_player()
+        if player:
+            subprocess.run(
+                ["busctl", "--user", "call", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "Next"],
+                capture_output=True, timeout=1
+            )
+
+    def previous_track(self):
+        try:
+            res = subprocess.run(["playerctl", "previous"], capture_output=True, timeout=1)
+            if res.returncode == 0:
+                return
+        except Exception:
+            pass
+        player, _ = self.get_active_player()
+        if player:
+            subprocess.run(
+                ["busctl", "--user", "call", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "Previous"],
+                capture_output=True, timeout=1
+            )
+
+class AppleToggle(QAbstractButton):
+    """Công tắc iOS Toggle Switch siêu mượt mà."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setFixedSize(38, 22)
+        self.setCursor(Qt.PointingHandCursor)
+        self._pos = 2.0
+        self.is_dark = True
+        self.anim = QPropertyAnimation(self, b"thumb_pos", self)
+        self.anim.setDuration(130)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def set_dark(self, is_dark):
+        self.is_dark = is_dark
+        self.update()
+
+    def get_thumb_pos(self):
+        return self._pos
+
+    def set_thumb_pos(self, pos):
+        self._pos = pos
+        self.update()
+
+    thumb_pos = Property(float, get_thumb_pos, set_thumb_pos)
+
+    def nextCheckState(self):
+        super().nextCheckState()
+        self.anim.stop()
+        self.anim.setStartValue(self._pos)
+        self.anim.setEndValue(18.0 if self.isChecked() else 2.0)
+        self.anim.start()
+
+    def setChecked(self, checked):
+        super().setChecked(checked)
+        self._pos = 18.0 if checked else 2.0
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        if self.isChecked():
+            # Action Blue #0071E3
+            bg_color = QColor("#0071E3")
+        else:
+            bg_color = QColor(120, 120, 128, 70) if self.is_dark else QColor(120, 120, 128, 45)
+
+        # Track
+        p.setBrush(bg_color)
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, 38, 22, 11, 11)
+
+        # Thumb
+        p.setBrush(QColor("#FFFFFF"))
+        p.setPen(QColor(0, 0, 0, 25))
+        p.drawEllipse(int(self._pos), 2, 18, 18)
+        p.end()
+
+class GUIIPCListener(QObject):
+    raise_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.running = True
+        self.sock = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        if os.path.exists(GUI_SOCK_PATH):
+            try:
+                os.unlink(GUI_SOCK_PATH)
+            except OSError:
+                pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.bind(GUI_SOCK_PATH)
+            self.sock.listen(5)
+            self.sock.settimeout(0.5)
+            while self.running:
+                try:
+                    conn, _ = self.sock.accept()
+                    conn.settimeout(1.0)
+                    msg = conn.recv(64).decode().strip()
+                    if msg == "SHOW":
+                        self.raise_requested.emit()
+                        conn.sendall(b"OK\n")
+                    conn.close()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    pass
+        finally:
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+            if os.path.exists(GUI_SOCK_PATH):
+                try:
+                    os.unlink(GUI_SOCK_PATH)
+                except OSError:
+                    pass
+
+class AirPodsManager(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.addr = "70:AE:2A:59:B8:8C"
+        self.name = "AirPod 4 ANC của KXT"
+        self.theme_pref = "system"
+        self.effective_theme = "dark"
+        self.current_mode = "anc"
+        self.adaptive_strength = 50
+        self.media_ctrl = MediaController()
+        self.is_playing = False
+
+        # Single instance listener
+        self.listener = GUIIPCListener(self)
+        self.listener.raise_requested.connect(self.on_raise_requested)
+
+        self.setup_ui()
+        self.load_settings()
+        self.apply_theme(self.theme_pref)
+
+        # Shortcuts
+        QShortcut(QKeySequence("Ctrl+Q"), self, self.quit_app)
+
+        # Refresh loop
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_state)
+        self.timer.start(1500)
+        self.refresh_state()
+
+    def quit_app(self):
+        QApplication.quit()
+
+    def on_raise_requested(self):
+        self.show()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event):
+        # Ẩn giao diện để app tiếp tục chạy ngầm mà không hiển thị tray icon
+        event.ignore()
+        self.hide()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if hasattr(self, 'timer') and self.timer.isActive():
+            self.timer.stop()
+        # Giải phóng bộ nhớ RAM triệt để khi ẩn cửa sổ
+        gc.collect()
+        if libc and hasattr(libc, 'malloc_trim'):
+            libc.malloc_trim(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_state()
+        if hasattr(self, 'timer') and not self.timer.isActive():
+            self.timer.start(1500)
+
+    def load_settings(self):
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r") as f:
+                    cfg = json.load(f)
+                    self.theme_pref = cfg.get("theme", "system")
+                    self.adaptive_strength = cfg.get("adaptive_strength", 50)
+            except Exception:
+                pass
+
+    def save_settings(self):
+        cfg = {}
+        if os.path.exists(CONFIG_PATH):
+            try:
+                cfg = json.load(open(CONFIG_PATH))
+            except Exception:
+                pass
+        cfg["theme"] = self.theme_pref
+        cfg["adaptive_strength"] = self.adaptive_strength
+        try:
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+    def setup_ui(self):
+        self.setWindowTitle("AirPods 4 ANC")
+        self.setFixedSize(400, 675)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(9)
+
+        # ================= 1. Header (AirPods Icon + Title + Status + Theme Switcher) =================
+        header_card = QFrame()
+        header_card.setObjectName("headerCard")
+        h_layout = QHBoxLayout(header_card)
+        h_layout.setContentsMargins(12, 8, 12, 8)
+        h_layout.setSpacing(10)
+
+        self.img_airpods = QLabel()
+        self.img_airpods.setFixedSize(40, 40)
+        self.update_airpods_logo()
+        h_layout.addWidget(self.img_airpods)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(2)
+        self.lbl_title = QLabel("AirPods 4 ANC")
+        self.lbl_title.setFont(QFont("SF Pro Text", 13, QFont.DemiBold))
+        self.lbl_status = QLabel("● Đang kết nối...")
+        self.lbl_status.setFont(QFont("SF Pro Text", 10))
+        info_col.addWidget(self.lbl_title)
+        info_col.addWidget(self.lbl_status)
+        h_layout.addLayout(info_col)
+        h_layout.addStretch()
+
+        # Theme Switcher Segmented [ Auto | ☼ | ☾ ] - Fix stretching
+        self.theme_bar = QFrame()
+        self.theme_bar.setObjectName("themeBar")
+        self.theme_bar.setFixedHeight(26)
+        tb_layout = QHBoxLayout(self.theme_bar)
+        tb_layout.setContentsMargins(2, 2, 2, 2)
+        tb_layout.setSpacing(2)
+
+        self.theme_buttons = {}
+        for k, text in (("system", "Auto"), ("light", "☼"), ("dark", "☾")):
+            b = QPushButton(text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(22)
+            if k == "system":
+                b.setFixedWidth(36)
+            else:
+                b.setFixedWidth(24)
+            b.setObjectName("subtleBtn")
+            b.clicked.connect(lambda chk=False, mode=k: self.apply_theme(mode))
+            tb_layout.addWidget(b)
+            self.theme_buttons[k] = b
+
+        h_layout.addWidget(self.theme_bar, 0, Qt.AlignVCenter)
+        layout.addWidget(header_card)
+
+        # ================= 2. Battery Status Card (L / R / Case) =================
+        self.battery_card = QFrame()
+        self.battery_card.setObjectName("card")
+        b_layout = QHBoxLayout(self.battery_card)
+        b_layout.setContentsMargins(12, 7, 12, 7)
+        b_layout.setSpacing(8)
+
+        # Left Earbud (L)
+        self.bat_box_l = QWidget()
+        l_row = QHBoxLayout(self.bat_box_l)
+        l_row.setContentsMargins(0, 0, 0, 0)
+        l_row.setSpacing(6)
+        self.ic_bat_l = QLabel()
+        self.ic_bat_l.setFixedSize(16, 16)
+        lbl_l_name = QLabel("Trái:")
+        lbl_l_name.setFont(QFont("SF Pro Text", 9.5))
+        lbl_l_name.setObjectName("descLbl")
+        self.lbl_bat_l = QLabel("--")
+        self.lbl_bat_l.setFont(QFont("SF Pro Text", 10.5, QFont.Bold))
+        l_row.addWidget(self.ic_bat_l)
+        l_row.addWidget(lbl_l_name)
+        l_row.addWidget(self.lbl_bat_l)
+        l_row.addStretch()
+        b_layout.addWidget(self.bat_box_l, 1)
+
+        div1 = QFrame()
+        div1.setFrameShape(QFrame.VLine)
+        div1.setFixedWidth(1)
+        div1.setObjectName("vDivider")
+        b_layout.addWidget(div1)
+
+        # Right Earbud (R)
+        self.bat_box_r = QWidget()
+        r_row = QHBoxLayout(self.bat_box_r)
+        r_row.setContentsMargins(0, 0, 0, 0)
+        r_row.setSpacing(6)
+        self.ic_bat_r = QLabel()
+        self.ic_bat_r.setFixedSize(16, 16)
+        lbl_r_name = QLabel("Phải:")
+        lbl_r_name.setFont(QFont("SF Pro Text", 9.5))
+        lbl_r_name.setObjectName("descLbl")
+        self.lbl_bat_r = QLabel("--")
+        self.lbl_bat_r.setFont(QFont("SF Pro Text", 10.5, QFont.Bold))
+        r_row.addWidget(self.ic_bat_r)
+        r_row.addWidget(lbl_r_name)
+        r_row.addWidget(self.lbl_bat_r)
+        r_row.addStretch()
+        b_layout.addWidget(self.bat_box_r, 1)
+
+        div2 = QFrame()
+        div2.setFrameShape(QFrame.VLine)
+        div2.setFixedWidth(1)
+        div2.setObjectName("vDivider")
+        b_layout.addWidget(div2)
+
+        # Case (Hộp sạc)
+        self.bat_box_c = QWidget()
+        c_row = QHBoxLayout(self.bat_box_c)
+        c_row.setContentsMargins(0, 0, 0, 0)
+        c_row.setSpacing(6)
+        self.ic_bat_c = QLabel()
+        self.ic_bat_c.setFixedSize(16, 16)
+        lbl_c_name = QLabel("Hộp:")
+        lbl_c_name.setFont(QFont("SF Pro Text", 9.5))
+        lbl_c_name.setObjectName("descLbl")
+        self.lbl_bat_c = QLabel("--")
+        self.lbl_bat_c.setFont(QFont("SF Pro Text", 10.5, QFont.Bold))
+        c_row.addWidget(self.ic_bat_c)
+        c_row.addWidget(lbl_c_name)
+        c_row.addWidget(self.lbl_bat_c)
+        c_row.addStretch()
+        b_layout.addWidget(self.bat_box_c, 1)
+
+        layout.addWidget(self.battery_card)
+
+        # ================= 2. Media Player Card (Now Playing Widget) =================
+        self.media_card = QFrame()
+        self.media_card.setObjectName("card")
+        m_layout = QHBoxLayout(self.media_card)
+        m_layout.setContentsMargins(12, 9, 12, 9)
+        m_layout.setSpacing(10)
+
+        # Thumbnail art
+        self.lbl_media_art = QLabel()
+        self.lbl_media_art.setFixedSize(38, 38)
+        self.lbl_media_art.setAlignment(Qt.AlignCenter)
+        self.lbl_media_art.setObjectName("mediaArt")
+        m_layout.addWidget(self.lbl_media_art)
+
+        # Track details
+        track_col = QVBoxLayout()
+        track_col.setSpacing(1)
+        self.lbl_track_title = QLabel("Đang tải bài hát...")
+        self.lbl_track_title.setFont(QFont("SF Pro Text", 11, QFont.DemiBold))
+        self.lbl_track_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_track_artist = QLabel("Firefox")
+        self.lbl_track_artist.setFont(QFont("SF Pro Text", 9.5))
+        self.lbl_track_artist.setObjectName("descLbl")
+        track_col.addWidget(self.lbl_track_title)
+        track_col.addWidget(self.lbl_track_artist)
+        m_layout.addLayout(track_col, 1)
+
+        # Controls (Previous, Play/Pause, Next)
+        self.btn_prev = QPushButton()
+        self.btn_prev.setFixedSize(28, 28)
+        self.btn_prev.setIconSize(QSize(14, 14))
+        self.btn_prev.setCursor(Qt.PointingHandCursor)
+        self.btn_prev.setObjectName("mediaCircleBtn")
+        self.btn_prev.clicked.connect(self.on_media_prev)
+
+        self.btn_play = QPushButton()
+        self.btn_play.setFixedSize(32, 32)
+        self.btn_play.setIconSize(QSize(16, 16))
+        self.btn_play.setCursor(Qt.PointingHandCursor)
+        self.btn_play.setObjectName("mediaPlayBtn")
+        self.btn_play.clicked.connect(self.on_media_play_pause)
+
+        self.btn_next = QPushButton()
+        self.btn_next.setFixedSize(28, 28)
+        self.btn_next.setIconSize(QSize(14, 14))
+        self.btn_next.setCursor(Qt.PointingHandCursor)
+        self.btn_next.setObjectName("mediaCircleBtn")
+        self.btn_next.clicked.connect(self.on_media_next)
+
+        m_layout.addWidget(self.btn_prev)
+        m_layout.addWidget(self.btn_play)
+        m_layout.addWidget(self.btn_next)
+        layout.addWidget(self.media_card)
+
+        # ================= 3. Quick Switch Action Pills (Cướp / Nhả) =================
+        switch_row = QHBoxLayout()
+        switch_row.setSpacing(8)
+
+        self.btn_takeover = QPushButton(" Cướp từ iPhone")
+        self.btn_takeover.setFixedHeight(34)
+        self.btn_takeover.setIconSize(QSize(14, 14))
+        self.btn_takeover.setCursor(Qt.PointingHandCursor)
+        self.btn_takeover.setObjectName("btnPrimary")
+        self.btn_takeover.clicked.connect(self.on_takeover)
+
+        self.btn_release = QPushButton(" Nhả cho iPhone")
+        self.btn_release.setFixedHeight(34)
+        self.btn_release.setIconSize(QSize(14, 14))
+        self.btn_release.setCursor(Qt.PointingHandCursor)
+        self.btn_release.setObjectName("btnSecondary")
+        self.btn_release.clicked.connect(self.on_release)
+
+        switch_row.addWidget(self.btn_takeover)
+        switch_row.addWidget(self.btn_release)
+        layout.addLayout(switch_row)
+
+        # ================= 4. Noise Control Segmented Bar [ Chống ồn | Xuyên âm | Thích ứng | Tắt ] =================
+        self.noise_card = QFrame()
+        self.noise_card.setObjectName("card")
+        nc_layout = QVBoxLayout(self.noise_card)
+        nc_layout.setContentsMargins(10, 8, 10, 8)
+        nc_layout.setSpacing(6)
+
+        lbl_nc = QLabel("KIỂM SOÁT TIẾNG ỒN")
+        lbl_nc.setFont(QFont("SF Pro Text", 9, QFont.Bold))
+        lbl_nc.setObjectName("sectionHeader")
+        nc_layout.addWidget(lbl_nc)
+
+        self.mode_grid_widget = QWidget()
+        grid_layout = QGridLayout(self.mode_grid_widget)
+        grid_layout.setContentsMargins(0, 2, 0, 2)
+        grid_layout.setSpacing(6)
+
+        self.mode_buttons = {}
+        modes = [
+            ("anc", "speaker-x-mark", "Chống ồn (ANC)", 0, 0),
+            ("transparency", "speaker-wave", "Xuyên âm", 0, 1),
+            ("adaptive", "sparkles", "Thích ứng", 1, 0),
+            ("off", "no-symbol", "Tắt kiểm soát", 1, 1)
+        ]
+        for k, ic_name, text, r, c in modes:
+            btn = QPushButton(f"  {text}")
+            btn.setFixedHeight(36)
+            btn.setIconSize(QSize(16, 16))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setObjectName("segBtn")
+            btn.setProperty("icon_name", ic_name)
+            btn.clicked.connect(lambda chk=False, m=k: self.set_noise_mode(m))
+            grid_layout.addWidget(btn, r, c)
+            self.mode_buttons[k] = btn
+        nc_layout.addWidget(self.mode_grid_widget)
+
+        # Adaptive tuning sub-bar [ Nhiều ồn | Cân bằng | Ít ồn ]
+        self.tune_bar = QFrame()
+        self.tune_bar.setObjectName("segmentedBar")
+        tb_tune_layout = QHBoxLayout(self.tune_bar)
+        tb_tune_layout.setContentsMargins(2, 2, 2, 2)
+        tb_tune_layout.setSpacing(2)
+
+        self.tune_buttons = {}
+        tunes = [(0, "Nhiều ồn"), (50, "Cân bằng"), (100, "Ít ồn")]
+        for val, text in tunes:
+            btn = QPushButton(text)
+            btn.setFixedHeight(24)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setObjectName("segSubBtn")
+            btn.clicked.connect(lambda chk=False, v=val: self.set_adaptive_strength(v))
+            tb_tune_layout.addWidget(btn)
+            self.tune_buttons[val] = btn
+        nc_layout.addWidget(self.tune_bar)
+        layout.addWidget(self.noise_card)
+
+        # ================= 5. Smart Features Group (iOS Settings Table Style) =================
+        self.smart_card = QFrame()
+        self.smart_card.setObjectName("card")
+        sf_layout = QVBoxLayout(self.smart_card)
+        sf_layout.setContentsMargins(12, 6, 12, 6)
+        sf_layout.setSpacing(0)
+
+        self.feature_toggles = {}
+        features = [
+            ("in_ear", "pause-circle", "Tự động tạm dừng (In-Ear)", "Dừng nhạc khi tháo cả 2 tai nghe"),
+            ("spatial", "globe-alt", "Âm thanh không gian 3D", "Mở rộng âm trường học & nhạc"),
+            ("awareness", "chat-bubble-left-right", "Nhận biết cuộc trò chuyện", "Hạ âm lượng nhạc khi bạn nói"),
+            ("idle_rel", "device-phone-mobile", "Tự động nhả khi rảnh (30s)", "Nhả cho iPhone khi laptop rảnh")
+        ]
+
+        for i, (key, icon_name, title, desc) in enumerate(features):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 6, 0, 6)
+            row_layout.setSpacing(8)
+
+            ic_box = QLabel()
+            ic_box.setFixedSize(26, 26)
+            ic_box.setAlignment(Qt.AlignCenter)
+            ic_box.setObjectName("iconBox")
+            ic_box.setProperty("icon_name", icon_name)
+            row_layout.addWidget(ic_box)
+
+            t_col = QVBoxLayout()
+            t_col.setSpacing(1)
+            t_lbl = QLabel(title)
+            t_lbl.setFont(QFont("SF Pro Text", 11, QFont.DemiBold))
+            d_lbl = QLabel(desc)
+            d_lbl.setFont(QFont("SF Pro Text", 9))
+            d_lbl.setObjectName("descLbl")
+            t_col.addWidget(t_lbl)
+            t_col.addWidget(d_lbl)
+            row_layout.addLayout(t_col, 1)
+
+            sw = AppleToggle()
+            sw.clicked.connect(lambda chk, k=key: self.toggle_smart_feature(k, chk))
+            row_layout.addWidget(sw)
+
+            sf_layout.addWidget(row)
+            self.feature_toggles[key] = (sw, ic_box)
+
+            if i < len(features) - 1:
+                divider = QFrame()
+                divider.setFrameShape(QFrame.HLine)
+                divider.setFixedHeight(1)
+                divider.setObjectName("divider")
+                sf_layout.addWidget(divider)
+
+        layout.addWidget(self.smart_card)
+
+        # ================= 6. Footer Status =================
+        self.lbl_msg = QLabel("Sẵn sàng.")
+        self.lbl_msg.setAlignment(Qt.AlignCenter)
+        self.lbl_msg.setFont(QFont("SF Pro Text", 9.5))
+        self.lbl_msg.setObjectName("footerMsg")
+        layout.addWidget(self.lbl_msg)
+
+    def update_airpods_logo(self):
+        pix = QPixmap("/opt/podhop/airpods.png")
+        if not pix.isNull():
+            dpr = get_dpr()
+            phys = int(40 * dpr)
+            scaled = pix.scaled(phys, phys, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled.setDevicePixelRatio(dpr)
+            self.img_airpods.setPixmap(scaled)
+
+    def apply_theme(self, mode):
+        self.theme_pref = mode
+        self.save_settings()
+
+        if mode == "system":
+            self.effective_theme = get_system_theme()
+        else:
+            self.effective_theme = mode
+
+        is_dark = (self.effective_theme == "dark")
+
+        # Apple Design Guidelines from /design-md/apple/DESIGN.md
+        if is_dark:
+            qss = """
+            QMainWindow { background-color: #161618; color: #FFFFFF; }
+            QLabel { color: #FFFFFF; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; }
+            QFrame#card, QFrame#headerCard {
+                background-color: #242426;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+            }
+            QFrame#themeBar, QFrame#segmentedBar {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+            }
+            QLabel#sectionHeader { color: #86868B; letter-spacing: 0.4px; }
+            QLabel#descLbl, QLabel#footerMsg { color: #86868B; }
+            QFrame#divider { background-color: rgba(84, 84, 88, 0.36); }
+            QFrame#vDivider { background-color: rgba(84, 84, 88, 0.36); }
+            QLabel#iconBox { background-color: rgba(255, 255, 255, 0.07); border-radius: 6px; }
+
+            QPushButton#subtleBtn {
+                background: transparent; color: #86868B; border: none; border-radius: 5px; font-size: 10px; font-weight: 500; height: 22px; max-height: 22px; min-height: 22px; padding: 0px 2px;
+            }
+            QPushButton#subtleBtn:hover { color: #FFFFFF; background-color: rgba(255, 255, 255, 0.08); }
+            QPushButton#subtleBtnActive {
+                background-color: #3A3A3C; color: #FFFFFF; border-radius: 5px; font-size: 10px; font-weight: 600; height: 22px; max-height: 22px; min-height: 22px; padding: 0px 2px; border: 1px solid rgba(255, 255, 255, 0.12);
+            }
+
+            QPushButton#segBtn {
+                background-color: rgba(255, 255, 255, 0.08); color: #A1A1A6; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 9px; font-size: 11px; font-weight: 500; padding: 0px 8px;
+            }
+            QPushButton#segBtn:hover { background-color: rgba(255, 255, 255, 0.13); color: #FFFFFF; }
+            QPushButton#segBtnActive {
+                background-color: #0071E3; color: #FFFFFF; border-radius: 9px; font-size: 11px; font-weight: 600; padding: 0px 8px; border: 1px solid rgba(255, 255, 255, 0.20);
+            }
+
+            QPushButton#segSubBtn {
+                background: transparent; color: #86868B; border: none; border-radius: 5px; font-size: 10px; font-weight: 500; padding: 2px;
+            }
+            QPushButton#segSubBtn:hover { color: #FFFFFF; }
+            QPushButton#segSubBtnActive {
+                background-color: #3A3A3C; color: #FFFFFF; border-radius: 5px; font-size: 10px; font-weight: 600; padding: 2px;
+            }
+
+            QPushButton#btnPrimary {
+                background-color: #0071E3; color: #FFFFFF; border: none; border-radius: 17px; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#btnPrimary:hover { background-color: #0077ED; }
+            QPushButton#btnPrimary:pressed { background-color: #005BB5; }
+
+            QPushButton#btnSecondary {
+                background-color: rgba(255, 255, 255, 0.08); color: #FFFFFF; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 17px; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#btnSecondary:hover { background-color: rgba(255, 255, 255, 0.12); }
+            QPushButton#btnSecondary:pressed { background-color: rgba(255, 255, 255, 0.05); }
+
+            QPushButton#mediaCircleBtn {
+                background-color: rgba(255, 255, 255, 0.08); border: none; border-radius: 14px;
+            }
+            QPushButton#mediaCircleBtn:hover { background-color: rgba(255, 255, 255, 0.15); }
+
+            QPushButton#mediaPlayBtn {
+                background-color: #FFFFFF; border: none; border-radius: 16px;
+            }
+            QPushButton#mediaPlayBtn:hover { background-color: #E5E5E7; }
+            """
+            prev_color = "#FFFFFF"
+            play_color = "#161618"
+            subtle_icon = "#86868B"
+        else:
+            qss = """
+            QMainWindow { background-color: #F5F5F7; color: #1D1D1F; }
+            QLabel { color: #1D1D1F; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; }
+            QFrame#card, QFrame#headerCard {
+                background-color: #FFFFFF;
+                border: 1px solid rgba(0, 0, 0, 0.08);
+                border-radius: 14px;
+            }
+            QFrame#themeBar, QFrame#segmentedBar {
+                background-color: rgba(0, 0, 0, 0.05);
+                border-radius: 8px;
+            }
+            QLabel#sectionHeader { color: #86868B; letter-spacing: 0.4px; }
+            QLabel#descLbl, QLabel#footerMsg { color: #86868B; }
+            QFrame#divider { background-color: #E5E5EA; }
+            QFrame#vDivider { background-color: #E5E5EA; }
+            QLabel#iconBox { background-color: rgba(0, 0, 0, 0.05); border-radius: 6px; }
+
+            QPushButton#subtleBtn {
+                background: transparent; color: #86868B; border: none; border-radius: 5px; font-size: 10px; font-weight: 500; height: 22px; max-height: 22px; min-height: 22px; padding: 0px 2px;
+            }
+            QPushButton#subtleBtn:hover { color: #1D1D1F; background-color: rgba(0, 0, 0, 0.05); }
+            QPushButton#subtleBtnActive {
+                background-color: #FFFFFF; color: #1D1D1F; border-radius: 5px; font-size: 10px; font-weight: 600; height: 22px; max-height: 22px; min-height: 22px; padding: 0px 2px; border: 1px solid rgba(0, 0, 0, 0.10);
+            }
+
+            QPushButton#segBtn {
+                background-color: rgba(0, 0, 0, 0.04); color: #6E6E73; border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 9px; font-size: 11px; font-weight: 500; padding: 0px 8px;
+            }
+            QPushButton#segBtn:hover { background-color: rgba(0, 0, 0, 0.08); color: #1D1D1F; }
+            QPushButton#segBtnActive {
+                background-color: #0071E3; color: #FFFFFF; border-radius: 9px; font-size: 11px; font-weight: 600; padding: 0px 8px; border: none;
+            }
+
+            QPushButton#segSubBtn {
+                background: transparent; color: #86868B; border: none; border-radius: 5px; font-size: 10px; font-weight: 500; padding: 2px;
+            }
+            QPushButton#segSubBtn:hover { color: #1D1D1F; }
+            QPushButton#segSubBtnActive {
+                background-color: #FFFFFF; color: #1D1D1F; border-radius: 5px; font-size: 10px; font-weight: 600; padding: 2px; border: 1px solid rgba(0,0,0,0.10);
+            }
+
+            QPushButton#btnPrimary {
+                background-color: #0066CC; color: #FFFFFF; border: none; border-radius: 17px; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#btnPrimary:hover { background-color: #0071E3; }
+            QPushButton#btnPrimary:pressed { background-color: #005BB5; }
+
+            QPushButton#btnSecondary {
+                background-color: #FFFFFF; color: #1D1D1F; border: 1px solid rgba(0, 0, 0, 0.14); border-radius: 17px; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#btnSecondary:hover { background-color: #F8F8FA; border-color: rgba(0, 0, 0, 0.22); }
+            QPushButton#btnSecondary:pressed { background-color: #EAEAEE; }
+
+            QPushButton#mediaCircleBtn {
+                background-color: rgba(0, 0, 0, 0.06); border: none; border-radius: 14px;
+            }
+            QPushButton#mediaCircleBtn:hover { background-color: rgba(0, 0, 0, 0.12); }
+
+            QPushButton#mediaPlayBtn {
+                background-color: #1D1D1F; border: none; border-radius: 16px;
+            }
+            QPushButton#mediaPlayBtn:hover { background-color: #333336; }
+            """
+            prev_color = "#1D1D1F"
+            play_color = "#FFFFFF"
+            subtle_icon = "#86868B"
+
+        self.setStyleSheet(qss)
+
+        # Theme buttons active state
+        for k, btn in self.theme_buttons.items():
+            btn.setObjectName("subtleBtnActive" if k == self.theme_pref else "subtleBtn")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+        # Smart features icons & toggles
+        for key, (sw, ic_box) in self.feature_toggles.items():
+            sw.set_dark(is_dark)
+            ic_name = ic_box.property("icon_name")
+            ic_box.setPixmap(load_tinted_pixmap(ic_name, subtle_icon, (16, 16)))
+
+        # Media controls icons
+        self.btn_prev.setIcon(load_tinted_icon("backward", prev_color, (14, 14)))
+        self.btn_next.setIcon(load_tinted_icon("forward", prev_color, (14, 14)))
+        play_ic = "pause" if self.is_playing else "play"
+        self.btn_play.setIcon(load_tinted_icon(play_ic, play_color, (16, 16)))
+
+        self.btn_takeover.setIcon(load_tinted_icon("bolt", "#FFFFFF", (14, 14)))
+        self.btn_release.setIcon(load_tinted_icon("device-phone-mobile", prev_color, (14, 14)))
+
+        # Battery icons
+        self.ic_bat_l.setPixmap(load_tinted_pixmap("airpod-left", subtle_icon, (16, 16)))
+        self.ic_bat_r.setPixmap(load_tinted_pixmap("airpod-right", subtle_icon, (16, 16)))
+        self.ic_bat_c.setPixmap(load_tinted_pixmap("airpod-case", subtle_icon, (16, 16)))
+
+        self.update_airpods_logo()
+        self.update_mode_ui()
+        self.update_tune_ui()
+
+    def update_mode_ui(self):
+        is_dark = (self.effective_theme == "dark")
+        for k, btn in self.mode_buttons.items():
+            is_active = (k == self.current_mode)
+            btn.setObjectName("segBtnActive" if is_active else "segBtn")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+            ic_name = btn.property("icon_name")
+            ic_col = "#FFFFFF" if is_active else ("#A1A1A6" if is_dark else "#6E6E73")
+            btn.setIcon(load_tinted_icon(ic_name, ic_col, (16, 16)))
+        
+        self.tune_bar.setVisible(self.current_mode == "adaptive")
+
+    def update_tune_ui(self):
+        for val, btn in self.tune_buttons.items():
+            btn.setObjectName("segSubBtnActive" if val == self.adaptive_strength else "segSubBtn")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def set_noise_mode(self, mode_name):
+        self.current_mode = mode_name
+        self.update_mode_ui()
+        send_daemon_cmd(f"mode {mode_name}")
+        labels = {"anc": "Chống ồn (ANC)", "transparency": "Xuyên âm", "adaptive": "Thích ứng", "off": "Tắt kiểm soát"}
+        self.lbl_msg.setText(f"Đã chuyển sang: {labels.get(mode_name, mode_name)}")
+
+    def set_adaptive_strength(self, val):
+        self.adaptive_strength = val
+        self.update_tune_ui()
+        send_daemon_cmd(f"adaptive_strength {val}")
+        t_labels = {0: "Nhiều tiếng ồn hơn", 50: "Cân bằng (Mặc định)", 100: "Ít tiếng ồn hơn"}
+        self.lbl_msg.setText(f"Mức thích ứng: {t_labels.get(val, f'{val}%')}")
+
+    def toggle_smart_feature(self, key, checked):
+        state_str = "on" if checked else "off"
+        if key == "in_ear":
+            send_daemon_cmd(f"ear {state_str}")
+            self.lbl_msg.setText(f"Tự động tạm dừng (In-Ear): {'Bật' if checked else 'Tắt'}")
+        elif key == "spatial":
+            send_daemon_cmd(f"spatial {state_str}")
+            self.lbl_msg.setText(f"Âm thanh không gian 3D: {'Bật' if checked else 'Tắt'}")
+        elif key == "awareness":
+            send_daemon_cmd(f"awareness {state_str}")
+            self.lbl_msg.setText(f"Nhận biết cuộc trò chuyện: {'Bật' if checked else 'Tắt'}")
+        elif key == "idle_rel":
+            send_daemon_cmd(f"idle_release {state_str}")
+            self.lbl_msg.setText(f"Tự động nhả khi rảnh (30s): {'Bật' if checked else 'Tắt'}")
+
+    def on_takeover(self):
+        self.lbl_msg.setText("⏳ Đang cướp từ iPhone (~2s)...")
+        def worker():
+            resp = send_daemon_cmd("switch")
+            if resp and resp.startswith("OK"):
+                self.lbl_msg.setText("✅ Cướp tai nghe thành công!")
+            else:
+                self.lbl_msg.setText(f"❌ {resp or 'Thất bại'}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_release(self):
+        self.lbl_msg.setText("⏳ Đang nhả tai nghe...")
+        def worker():
+            resp = send_daemon_cmd("release")
+            if resp and resp.startswith("OK"):
+                self.lbl_msg.setText("📲 Đã nhả tai nghe cho iPhone!")
+            else:
+                self.lbl_msg.setText(f"❌ {resp or 'Thất bại'}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_media_play_pause(self):
+        self.is_playing = not self.is_playing
+        play_color = "#161618" if (self.effective_theme == "dark") else "#FFFFFF"
+        self.btn_play.setIcon(load_tinted_icon("pause" if self.is_playing else "play", play_color, (16, 16)))
+        def worker():
+            self.media_ctrl.play_pause()
+            time.sleep(0.3)
+            _, st = self.media_ctrl.get_active_player()
+            self.is_playing = (st == "Playing")
+            play_col = "#161618" if (self.effective_theme == "dark") else "#FFFFFF"
+            self.btn_play.setIcon(load_tinted_icon("pause" if self.is_playing else "play", play_col, (16, 16)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_media_next(self):
+        threading.Thread(target=self.media_ctrl.next_track, daemon=True).start()
+
+    def on_media_prev(self):
+        threading.Thread(target=self.media_ctrl.previous_track, daemon=True).start()
+
+    def refresh_state(self):
+        # 1. Media Player Info (tối ưu hóa 1 lệnh duy nhất)
+        player, status, meta = self.media_ctrl.get_media_info()
+        self.is_playing = (status == "Playing")
+        play_color = "#161618" if (self.effective_theme == "dark") else "#FFFFFF"
+        self.btn_play.setIcon(load_tinted_icon("pause" if self.is_playing else "play", play_color, (16, 16)))
+        title = meta.get("title", "")
+        artist = meta.get("artist", "")
+        art_url = meta.get("art_url", "")
+        app_name = meta.get("app_name", "Media")
+
+        # Smooth elided text
+        fm = QFontMetrics(self.lbl_track_title.font())
+        elided_title = fm.elidedText(title, Qt.ElideRight, 205)
+        self.lbl_track_title.setText(elided_title)
+        
+        fm_art = QFontMetrics(self.lbl_track_artist.font())
+        sub_text = f"{artist} · {app_name}" if artist else app_name
+        self.lbl_track_artist.setText(fm_art.elidedText(sub_text, Qt.ElideRight, 205))
+
+        # Thumbnail art (chỉ render lại khi đổi bài hát để tiết kiệm RAM/CPU)
+        if art_url != getattr(self, "current_art_url", None):
+            self.current_art_url = art_url
+            if art_url and os.path.exists(art_url):
+                try:
+                    dpr = get_dpr()
+                    phys_size = int(38 * dpr)
+                    src = QPixmap(art_url).scaled(phys_size, phys_size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                    dest = QPixmap(phys_size, phys_size)
+                    dest.setDevicePixelRatio(dpr)
+                    dest.fill(Qt.transparent)
+                    p = QPainter(dest)
+                    p.setRenderHint(QPainter.Antialiasing)
+                    p.setRenderHint(QPainter.SmoothPixmapTransform)
+                    path = QPainterPath()
+                    path.addRoundedRect(0, 0, 38, 38, 8, 8)
+                    p.setClipPath(path)
+                    p.drawPixmap(0, 0, 38, 38, src)
+                    p.end()
+                    self.lbl_media_art.setPixmap(dest)
+                except Exception:
+                    self.set_default_art()
+            else:
+                self.set_default_art()
+
+        # 2. Daemon Status & Battery
+        ipc_resp = send_daemon_cmd("status")
+        if ipc_resp and ipc_resp.startswith("OK"):
+            props = dict(item.split("=", 1) for item in ipc_resp[3:].split() if "=" in item)
+            connected = (props.get("status") == "connected")
+            bat_l = props.get("bat_l", "-1")
+            bat_r = props.get("bat_r", "-1")
+            bat_c = props.get("bat_c", "-1")
+            bat_c_conn = props.get("bat_c_conn", "0")
+            bat_main = props.get("bat_main", "-1")
+            chg_l = props.get("chg_l", "0")
+            chg_r = props.get("chg_r", "0")
+            chg_c = props.get("chg_c", "0")
+            mode = props.get("mode", self.current_mode)
+            try:
+                adapt_str = int(props.get("adapt_str", 50))
+            except ValueError:
+                adapt_str = 50
+            
+            if mode != self.current_mode:
+                self.current_mode = mode
+                self.update_mode_ui()
+            if adapt_str != self.adaptive_strength:
+                self.adaptive_strength = adapt_str
+                self.update_tune_ui()
+
+            def get_bat_color(val):
+                try:
+                    v = int(val)
+                    if v > 20: return "#34C759"
+                    if v > 10: return "#FF9500"
+                    return "#FF3B30"
+                except Exception:
+                    return "#86868B"
+
+            if connected:
+                self.lbl_status.setText("● Đã kết nối (AAC • 48 kHz)")
+                self.lbl_status.setStyleSheet("color: #34C759; font-weight: 500;")
+                self.btn_takeover.setEnabled(True)
+                self.btn_release.setEnabled(True)
+
+                # Left earbud battery
+                if bat_l != "-1":
+                    chg_mark = " ⚡" if chg_l == "1" else ""
+                    self.lbl_bat_l.setText(f"{bat_l}%{chg_mark}")
+                    self.lbl_bat_l.setStyleSheet(f"color: {get_bat_color(bat_l)};")
+                elif bat_main != "-1":
+                    self.lbl_bat_l.setText(f"{bat_main}%")
+                    self.lbl_bat_l.setStyleSheet(f"color: {get_bat_color(bat_main)};")
+                else:
+                    self.lbl_bat_l.setText("--")
+                    self.lbl_bat_l.setStyleSheet("color: #86868B;")
+
+                # Right earbud battery
+                if bat_r != "-1":
+                    chg_mark = " ⚡" if chg_r == "1" else ""
+                    self.lbl_bat_r.setText(f"{bat_r}%{chg_mark}")
+                    self.lbl_bat_r.setStyleSheet(f"color: {get_bat_color(bat_r)};")
+                elif bat_main != "-1":
+                    self.lbl_bat_r.setText(f"{bat_main}%")
+                    self.lbl_bat_r.setStyleSheet(f"color: {get_bat_color(bat_main)};")
+                else:
+                    self.lbl_bat_r.setText("--")
+                    self.lbl_bat_r.setStyleSheet("color: #86868B;")
+
+                # Case battery
+                if bat_c != "-1":
+                    chg_mark = " ⚡" if chg_c == "1" else ""
+                    if bat_c_conn == "1":
+                        self.lbl_bat_c.setText(f"{bat_c}%{chg_mark}")
+                        self.lbl_bat_c.setStyleSheet(f"color: {get_bat_color(bat_c)};")
+                        self.bat_box_c.setToolTip(f"Hộp sạc: {bat_c}% (Đang mở nắp / Đang kết nối)")
+                    else:
+                        self.lbl_bat_c.setText(f"~{bat_c}%{chg_mark}")
+                        self.lbl_bat_c.setStyleSheet(f"color: {get_bat_color(bat_c)};")
+                        self.bat_box_c.setToolTip(f"Hộp sạc: ~{bat_c}% (Nắp hộp đang đóng. Mức pin lưu từ lần mở nắp gần nhất)")
+                else:
+                    self.lbl_bat_c.setText("--")
+                    self.lbl_bat_c.setStyleSheet("color: #86868B;")
+                    self.bat_box_c.setToolTip("Mở nắp hộp để cập nhật mức pin của hộp sạc")
+            else:
+                self.lbl_status.setText("○ Đang trên iPhone hoặc trong hộp")
+                self.lbl_status.setStyleSheet("color: #86868B;")
+                self.btn_takeover.setEnabled(True)
+                self.btn_release.setEnabled(False)
+                self.lbl_bat_l.setText("--")
+                self.lbl_bat_l.setStyleSheet("color: #86868B;")
+                self.lbl_bat_r.setText("--")
+                self.lbl_bat_r.setStyleSheet("color: #86868B;")
+                self.lbl_bat_c.setText("--")
+                self.lbl_bat_c.setStyleSheet("color: #86868B;")
+
+            # Sync toggles
+            for key, (sw, _) in self.feature_toggles.items():
+                sw.blockSignals(True)
+                if key == "in_ear":
+                    sw.setChecked(props.get("in_ear") == "1")
+                elif key == "spatial":
+                    sw.setChecked(props.get("spatial") == "1")
+                elif key == "awareness":
+                    sw.setChecked(props.get("awareness") == "1")
+                elif key == "idle_rel":
+                    sw.setChecked(props.get("idle_rel") == "1")
+                sw.blockSignals(False)
+
+    def set_default_art(self):
+        dpr = get_dpr()
+        phys_size = int(38 * dpr)
+        pm = load_tinted_pixmap("musical-note", "#0071E3", (22, 22))
+        dest = QPixmap(phys_size, phys_size)
+        dest.setDevicePixelRatio(dpr)
+        dest.fill(Qt.transparent)
+        p = QPainter(dest)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QColor(0, 113, 227, 28))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, 38, 38, 8, 8)
+        if not pm.isNull():
+            p.drawPixmap(8, 8, 22, 22, pm)
+        p.end()
+        self.lbl_media_art.setPixmap(dest)
+
+if __name__ == "__main__":
+    if try_raise_existing_instance():
+        sys.exit(0)
+
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    app = QApplication(sys.argv)
+    app.setApplicationName("airpods")
+    app.setDesktopFileName("airpods")
+    app.setWindowIcon(QIcon("/opt/podhop/airpods.png"))
+    app.setQuitOnLastWindowClosed(False)
+    win = AirPodsManager()
+    win.show()
+    sys.exit(app.exec())
