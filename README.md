@@ -73,17 +73,26 @@ Hệ thống được tối ưu hóa sâu ở tầng C/Glibc và Qt Event Loop, 
 * **Tự động chuyển tai nghe từ iPhone sang Linux**: Khi máy tính bắt đầu phát âm thanh (YouTube, Spotify...), daemon kích hoạt L2CAP channel để kéo AirPods từ iPhone về máy tính trong **1.4s – 3s**.
 * **Tự động nhả tai nghe về iPhone (Auto Release)**: Khi máy tính ngừng phát âm thanh trong 30 giây, daemon tự động giải phóng kết nối để iPhone có thể lập tức phát nhạc/nghe cuộc gọi mà không bị máy tính chiếm giữ.
 
-### 5. Nhận biết cuộc trò chuyện & Âm thanh không gian
+### 5. Tùy biến bóp cuống tai & Đổi tên phần cứng Firmware
+* **Tùy biến thao tác bóp giữ (Stem Squeeze Customization)**:
+  * Cho phép gán độc lập hành động bóp giữ cho **Tai trái** và **Tai phải**: chuyển đổi chế độ **Chống ồn (ANC)** hoặc gọi **Trợ lý ảo (Siri / Voice Assistant)**.
+  * Tinh chỉnh 3 cấp độ phản hồi bóp giữ & tốc độ vuốt: **Chuẩn**, **Chậm**, **Rất chậm**.
+* **Đổi tên phần cứng vào Firmware (Hardware Rename via AAP)**:
+  * Cho phép đổi tên trực tiếp vào bộ nhớ flash của AirPods qua gói tin AAP opcode `0x001A`. Tên mới sẽ lưu vĩnh viễn trên tai nghe và hiển thị đồng bộ trên mọi thiết bị (iPhone, iPad, Mac, Linux...).
+  * Tự động đồng bộ alias với hệ thống Bluetooth Linux (`bluetoothctl set-alias`).
+
+### 6. Nhận biết cuộc trò chuyện & Âm thanh không gian
 * **Nhận biết cuộc trò chuyện (Conversational Awareness)**: Giao thức Apple AAP phần cứng tự động phát hiện khi bạn bắt đầu cất tiếng nói, tự động hạ âm lượng nhạc và tăng âm thanh xung quanh để bạn trò chuyện trực tiếp mà không cần tháo tai nghe.
 * **Âm thanh không gian (Spatial Audio)**: Kích hoạt chế độ mở rộng âm trường trên AirPods mang lại trải nghiệm xem phim, nghe nhạc và học tập sống động.
 
-### 6. Widget Trình phát nhạc toàn hệ thống (Now Playing Media Player)
+### 7. Widget Trình phát nhạc toàn hệ thống (Now Playing Media Player)
 * Tích hợp chuẩn **MPRIS D-Bus & playerctl**:
   * Điều khiển **Play / Pause / Next / Previous** mượt mà cho mọi ứng dụng đa phương tiện trên Linux.
   * Hiển thị ảnh bìa Album thực tế (Album Art) bo góc, tự động trích xuất thông tin Bài hát và Nghệ sĩ.
 
-### 7. Giao diện sắc nét & Tối ưu HiDPI Retina
-* Bố cục lưới điều khiển 2x2 to rõ, trực quan và dễ thao tác nhanh.
+### 8. Giao diện sắc nét & Tối ưu HiDPI Retina
+* Bố cục điều khiển trực quan, chuẩn phong cách Apple Control Center.
+* Tích hợp nút đổi tên nhanh (biểu tượng cây bút) ngay cạnh tên tai nghe.
 * Bộ biểu tượng **Heroicons Vector SVG** sắc nét 100% trên các màn hình độ phân giải cao Retina / HiDPI (**DPR 1.5x, 2.0x, 2.5x**).
 * Tự động đồng bộ giao diện Sáng / Tối theo hệ điều hành, hoặc chuyển đổi thủ công chỉ với 1 click.
 * **Cơ chế Single-Instance**: Click ra ngoài sẽ đóng cửa sổ về nền, khi mở lại app hiện lên tức thì trong 1 mili-giây mà không tạo nhiều tiến trình trùng lặp. Không hiển thị icon khay hệ thống (tray icon) gây rối thanh Taskbar.
@@ -172,6 +181,9 @@ File cấu hình được tự động tạo và lưu tại `~/.config/podhop.js
   "adaptive_strength": 50,
   "adaptive_volume": true,
   "spatial_enabled": true,
+  "stem_left": "anc",
+  "stem_right": "anc",
+  "stem_speed": 0,
   "theme": "system"
 }
 ```

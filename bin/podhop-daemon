@@ -60,6 +60,7 @@ PKT_FEATURES_ACK = bytes.fromhex("040004002b00")
 PKT_LINK_DROP = bytes.fromhex("00010000")
 PKT_NOISE = bytes.fromhex("0400040009000d")
 PKT_AWARENESS = bytes.fromhex("04000400090028")
+PKT_CLICK_HOLD = bytes.fromhex("04000400090016")
 PKT_BATTERY = bytes.fromhex("040004000400")
 PKT_EAR = bytes.fromhex("040004000600")
 
@@ -97,7 +98,10 @@ DEFAULT_CONFIG = {
     "pause_on_ear": "both",
     "adaptive_strength": 50,
     "adaptive_volume": True,
-    "spatial_enabled": False
+    "spatial_enabled": False,
+    "stem_left": "anc",
+    "stem_right": "anc",
+    "stem_speed": 0
 }
 
 def log(msg):
@@ -368,6 +372,9 @@ class PodHopDaemon:
         self.awareness_enabled = False
         self.cfg = load_config()
         self.addr = self.cfg.get("addr", "")
+        self.stem_left = self.cfg.get("stem_left", "anc")
+        self.stem_right = self.cfg.get("stem_right", "anc")
+        self.stem_speed = self.cfg.get("stem_speed", 0)
         self.mpris = MPRISController()
         self.ear_detector = EarDetector(
             self.mpris,
@@ -413,6 +420,7 @@ class PodHopDaemon:
                 resp2 = s.recv(64)
                 s.sendall(REQUEST_NOTIFICATIONS)
                 self.aap_sock = s
+                self._init_aap_features(s)
                 threading.Thread(target=self.aap_reader_loop, args=(s,), daemon=True).start()
                 log("AAP channel connected with real-time notifications (ear detect, battery, mode).")
                 return True
@@ -588,6 +596,14 @@ class PodHopDaemon:
                 self.adaptive_volume_enabled = val
                 log(f"[PodHop] Adaptive volume synced: {'Bật' if val else 'Tắt'}")
 
+        # 7. Stem ClickHold packet
+        elif pkt.startswith(PKT_CLICK_HOLD) and len(pkt) >= 9:
+            r_val = pkt[7]
+            l_val = pkt[8]
+            self.stem_right = "siri" if r_val == 0x05 else "anc"
+            self.stem_left = "siri" if l_val == 0x05 else "anc"
+            log(f"[PodHop] Cấu hình bóp cuống tai đồng bộ: Trái={self.stem_left.upper()}, Phải={self.stem_right.upper()}")
+
     def send_aap_packet(self, pkt):
         with self.aap_lock:
             if not self.aap_sock:
@@ -606,6 +622,7 @@ class PodHopDaemon:
                     resp2 = s.recv(64)
                     s.sendall(REQUEST_NOTIFICATIONS)
                     self.aap_sock = s
+                    self._init_aap_features(s)
                     threading.Thread(target=self.aap_reader_loop, args=(s,), daemon=True).start()
                 except Exception as e:
                     return False, str(e)
@@ -687,6 +704,72 @@ class PodHopDaemon:
             return True, st
         except Exception as e:
             return False, str(e)
+
+    def _init_aap_features(self, s):
+        try:
+            r_val = 0x05 if self.stem_right == "siri" else 0x01
+            l_val = 0x05 if self.stem_left == "siri" else 0x01
+            s.sendall(bytes.fromhex("04000400090016") + bytes([r_val, l_val, 0x00, 0x00]))
+            s.sendall(bytes.fromhex(f"04000400090018{self.stem_speed:02x}000000"))
+            s.sendall(bytes.fromhex(f"04000400090023{self.stem_speed:02x}000000"))
+        except Exception as e:
+            log(f"Init stem features error: {e}")
+
+    def set_stem_mode(self, left="anc", right="anc"):
+        left = "siri" if str(left).lower() == "siri" else "anc"
+        right = "siri" if str(right).lower() == "siri" else "anc"
+        self.stem_left = left
+        self.stem_right = right
+        self.cfg["stem_left"] = left
+        self.cfg["stem_right"] = right
+        save_config(self.cfg)
+        r_val = 0x05 if right == "siri" else 0x01
+        l_val = 0x05 if left == "siri" else 0x01
+        pkt = bytes.fromhex("04000400090016") + bytes([r_val, l_val, 0x00, 0x00])
+        ok, res = self.send_aap_packet(pkt)
+        if ok:
+            log(f"[PodHop] Đã cấu hình bóp giữ tai nghe: Trái={left.upper()}, Phải={right.upper()}")
+            return True, f"left={left} right={right}"
+        return True, f"saved: left={left} right={right}"
+
+    def set_stem_speed(self, speed=0):
+        try:
+            speed = max(0, min(2, int(speed)))
+        except (ValueError, TypeError):
+            speed = 0
+        self.stem_speed = speed
+        self.cfg["stem_speed"] = speed
+        save_config(self.cfg)
+        pkt_hold = bytes.fromhex(f"04000400090018{speed:02x}000000")
+        pkt_swipe = bytes.fromhex(f"04000400090023{speed:02x}000000")
+        ok, res = self.send_aap_packet(pkt_hold)
+        if ok:
+            self.send_aap_packet(pkt_swipe)
+            labels = ["Mặc định", "Chậm hơn", "Chậm nhất"]
+            log(f"[PodHop] Đã đặt tốc độ phản hồi bóp/vuốt: {labels[speed]}")
+            return True, str(speed)
+        return True, f"saved: {speed}"
+
+    def rename_device(self, new_name):
+        new_name = str(new_name).strip()
+        if not new_name:
+            return False, "Tên không được để trống"
+        name_bytes = new_name.encode("utf-8")
+        if len(name_bytes) > 64:
+            return False, "Tên quá dài (tối đa 64 ký tự)"
+        self.cfg["name"] = new_name
+        save_config(self.cfg)
+        try:
+            subprocess.run(["bluetoothctl", "set-alias", new_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        except Exception:
+            pass
+        # Apple AAP rename packet: 04 00 04 00 1a 00 01 [size] 00 [name_utf8]
+        pkt = bytes.fromhex("040004001a0001") + bytes([len(name_bytes), 0x00]) + name_bytes
+        ok, res = self.send_aap_packet(pkt)
+        if ok:
+            log(f"[PodHop] Đã đổi tên AirPods thành công vào firmware: '{new_name}'")
+            return True, new_name
+        return True, f"saved: {new_name}"
 
     def aap_takeover(self, addr):
         log(f"Paging {addr} on L2CAP PSM 0x{PSM:04X} (stealing from iPhone)...")
@@ -850,6 +933,36 @@ class PodHopDaemon:
             return f"OK {ok}"
         elif cmd == "get_mode":
             return f"OK {self.current_mode}"
+        elif cmd == "stem":
+            l = self.stem_left
+            r = self.stem_right
+            for p in parts[1:]:
+                if p.startswith("left="):
+                    l = p.split("=")[1].lower()
+                elif p.startswith("right="):
+                    r = p.split("=")[1].lower()
+                elif p in ("anc", "siri"):
+                    if l == self.stem_left:
+                        l = p
+                    else:
+                        r = p
+            ok, res = self.set_stem_mode(l, r)
+            return f"OK {res}" if ok else f"ERR {res}"
+        elif cmd in ("stem_speed", "swipe_speed"):
+            val = 0
+            if len(parts) > 1:
+                try:
+                    val = int(parts[1])
+                except ValueError:
+                    if parts[1] == "slower": val = 1
+                    elif parts[1] == "slowest": val = 2
+                    else: val = 0
+            ok, res = self.set_stem_speed(val)
+            return f"OK {res}" if ok else f"ERR {res}"
+        elif cmd == "rename":
+            new_name = " ".join(parts[1:]).strip()
+            ok, res = self.rename_device(new_name)
+            return f"OK {res}" if ok else f"ERR {res}"
         elif cmd == "status":
             conn = "connected" if is_bt_connected(self.addr) else "disconnected"
             aware = "1" if self.awareness_enabled else "0"
@@ -872,7 +985,8 @@ class PodHopDaemon:
             adapt_vol = "1" if self.adaptive_volume_enabled else "0"
             spatial_st = "1" if self.spatial_enabled else "0"
             idle_rel = "1" if self.cfg.get("disconnect_on_idle", True) else "0"
-            return f"OK status={conn} mode={self.current_mode} awareness={aware} in_ear={ear_on} ear_mode={ear_mode} ear_prim={prim} ear_sec={sec} bat_l={bl_str} bat_r={br_str} bat_c={bc_str} bat_c_conn={bcase_conn} bat_main={bz_str} chg_l={chg_l} chg_r={chg_r} chg_c={chg_c} adapt_str={self.adaptive_strength} adapt_vol={adapt_vol} spatial={spatial_st} idle_rel={idle_rel}"
+            dev_name = self.cfg.get("name", "")
+            return f"OK status={conn} mode={self.current_mode} awareness={aware} in_ear={ear_on} ear_mode={ear_mode} ear_prim={prim} ear_sec={sec} bat_l={bl_str} bat_r={br_str} bat_c={bc_str} bat_c_conn={bcase_conn} bat_main={bz_str} chg_l={chg_l} chg_r={chg_r} chg_c={chg_c} adapt_str={self.adaptive_strength} adapt_vol={adapt_vol} spatial={spatial_st} idle_rel={idle_rel} stem_l={self.stem_left} stem_r={self.stem_right} stem_spd={self.stem_speed} dev_name={dev_name}"
         return "ERR: unknown command"
 
     def ipc_worker(self):

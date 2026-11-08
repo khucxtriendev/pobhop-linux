@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 try:
     libc = ctypes.CDLL('libc.so.6')
@@ -36,7 +37,7 @@ from PySide6.QtGui import QFont, QIcon, QPixmap, QGuiApplication, QPainter, QCol
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QFrame, QAbstractButton, QSizePolicy
+    QLabel, QPushButton, QFrame, QAbstractButton, QSizePolicy, QInputDialog, QLineEdit
 )
 
 CONFIG_PATH = os.path.expanduser("~/.config/podhop.json")
@@ -457,6 +458,9 @@ class AirPodsManager(QMainWindow):
         self.effective_theme = "dark"
         self.current_mode = "anc"
         self.adaptive_strength = 50
+        self.stem_left = "anc"
+        self.stem_right = "anc"
+        self.stem_speed = 0
         self.media_ctrl = MediaController()
         self.is_playing = False
 
@@ -513,6 +517,9 @@ class AirPodsManager(QMainWindow):
                     cfg = json.load(f)
                     self.theme_pref = cfg.get("theme", "system")
                     self.adaptive_strength = cfg.get("adaptive_strength", 50)
+                    self.stem_left = cfg.get("stem_left", "anc")
+                    self.stem_right = cfg.get("stem_right", "anc")
+                    self.stem_speed = cfg.get("stem_speed", 0)
             except Exception:
                 pass
 
@@ -525,6 +532,9 @@ class AirPodsManager(QMainWindow):
                 pass
         cfg["theme"] = self.theme_pref
         cfg["adaptive_strength"] = self.adaptive_strength
+        cfg["stem_left"] = self.stem_left
+        cfg["stem_right"] = self.stem_right
+        cfg["stem_speed"] = self.stem_speed
         try:
             with open(CONFIG_PATH, "w") as f:
                 json.dump(cfg, f, indent=2)
@@ -533,15 +543,15 @@ class AirPodsManager(QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle("AirPods 4 ANC")
-        self.setFixedSize(400, 675)
+        self.setFixedSize(400, 725)
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
         self.setAttribute(Qt.WA_QuitOnClose, False)
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(9)
+        layout.setContentsMargins(13, 10, 13, 10)
+        layout.setSpacing(8)
 
         # ================= 1. Header (AirPods Icon + Title + Status + Theme Switcher) =================
         header_card = QFrame()
@@ -556,12 +566,28 @@ class AirPodsManager(QMainWindow):
         h_layout.addWidget(self.img_airpods)
 
         info_col = QVBoxLayout()
-        info_col.setSpacing(2)
+        info_col.setSpacing(1)
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
         self.lbl_title = QLabel("AirPods 4 ANC")
-        self.lbl_title.setFont(QFont("SF Pro Text", 13, QFont.DemiBold))
+        self.lbl_title.setFont(QFont("SF Pro Text", 12.5, QFont.DemiBold))
+        title_row.addWidget(self.lbl_title)
+
+        self.btn_rename = QPushButton()
+        self.btn_rename.setFixedSize(20, 20)
+        self.btn_rename.setIconSize(QSize(13, 13))
+        self.btn_rename.setCursor(Qt.PointingHandCursor)
+        self.btn_rename.setObjectName("subtleBtn")
+        self.btn_rename.setProperty("icon_name", "pencil-square")
+        self.btn_rename.setToolTip("Đổi tên AirPods trong firmware phần cứng")
+        self.btn_rename.clicked.connect(self.on_rename_clicked)
+        title_row.addWidget(self.btn_rename)
+        title_row.addStretch()
+
         self.lbl_status = QLabel("● Đang kết nối...")
-        self.lbl_status.setFont(QFont("SF Pro Text", 10))
-        info_col.addWidget(self.lbl_title)
+        self.lbl_status.setFont(QFont("SF Pro Text", 9.5))
+        info_col.addLayout(title_row)
         info_col.addWidget(self.lbl_status)
         h_layout.addLayout(info_col)
         h_layout.addStretch()
@@ -798,7 +824,137 @@ class AirPodsManager(QMainWindow):
         nc_layout.addWidget(self.tune_bar)
         layout.addWidget(self.noise_card)
 
-        # ================= 5. Smart Features Group (iOS Settings Table Style) =================
+        # ================= 5. Stem Squeeze Customization Card =================
+        self.stem_card = QFrame()
+        self.stem_card.setObjectName("card")
+        st_layout = QVBoxLayout(self.stem_card)
+        st_layout.setContentsMargins(12, 7, 12, 7)
+        st_layout.setSpacing(5)
+
+        lbl_stem = QLabel("BÓP GIỮ CUỐNG TAI (STEM SQUEEZE)")
+        lbl_stem.setFont(QFont("SF Pro Text", 9, QFont.Bold))
+        lbl_stem.setObjectName("sectionHeader")
+        st_layout.addWidget(lbl_stem)
+
+        # Row 1: Left Earbud (Tai trái)
+        r_left = QWidget()
+        rl_layout = QHBoxLayout(r_left)
+        rl_layout.setContentsMargins(0, 1, 0, 1)
+        rl_layout.setSpacing(8)
+
+        self.ic_stem_left = QLabel()
+        self.ic_stem_left.setFixedSize(20, 20)
+        self.ic_stem_left.setAlignment(Qt.AlignCenter)
+        self.ic_stem_left.setObjectName("iconBox")
+        self.ic_stem_left.setProperty("icon_name", "airpod-left")
+        rl_layout.addWidget(self.ic_stem_left)
+
+        lbl_l = QLabel("Tai trái:")
+        lbl_l.setFont(QFont("SF Pro Text", 10.5, QFont.Medium))
+        rl_layout.addWidget(lbl_l)
+        rl_layout.addStretch()
+
+        self.stem_l_bar = QFrame()
+        self.stem_l_bar.setObjectName("segmentedBar")
+        sl_layout = QHBoxLayout(self.stem_l_bar)
+        sl_layout.setContentsMargins(2, 2, 2, 2)
+        sl_layout.setSpacing(2)
+
+        self.btn_stem_l_anc = QPushButton("Chống ồn")
+        self.btn_stem_l_anc.setFixedHeight(22)
+        self.btn_stem_l_anc.setCursor(Qt.PointingHandCursor)
+        self.btn_stem_l_anc.setObjectName("segSubBtn")
+        self.btn_stem_l_anc.clicked.connect(lambda: self.set_stem_config(left="anc"))
+        sl_layout.addWidget(self.btn_stem_l_anc)
+
+        self.btn_stem_l_siri = QPushButton("Siri / Trợ lý")
+        self.btn_stem_l_siri.setFixedHeight(22)
+        self.btn_stem_l_siri.setCursor(Qt.PointingHandCursor)
+        self.btn_stem_l_siri.setObjectName("segSubBtn")
+        self.btn_stem_l_siri.clicked.connect(lambda: self.set_stem_config(left="siri"))
+        sl_layout.addWidget(self.btn_stem_l_siri)
+        rl_layout.addWidget(self.stem_l_bar)
+        st_layout.addWidget(r_left)
+
+        # Row 2: Right Earbud (Tai phải)
+        r_right = QWidget()
+        rr_layout = QHBoxLayout(r_right)
+        rr_layout.setContentsMargins(0, 1, 0, 1)
+        rr_layout.setSpacing(8)
+
+        self.ic_stem_right = QLabel()
+        self.ic_stem_right.setFixedSize(20, 20)
+        self.ic_stem_right.setAlignment(Qt.AlignCenter)
+        self.ic_stem_right.setObjectName("iconBox")
+        self.ic_stem_right.setProperty("icon_name", "airpod-right")
+        rr_layout.addWidget(self.ic_stem_right)
+
+        lbl_r = QLabel("Tai phải:")
+        lbl_r.setFont(QFont("SF Pro Text", 10.5, QFont.Medium))
+        rr_layout.addWidget(lbl_r)
+        rr_layout.addStretch()
+
+        self.stem_r_bar = QFrame()
+        self.stem_r_bar.setObjectName("segmentedBar")
+        sr_layout = QHBoxLayout(self.stem_r_bar)
+        sr_layout.setContentsMargins(2, 2, 2, 2)
+        sr_layout.setSpacing(2)
+
+        self.btn_stem_r_anc = QPushButton("Chống ồn")
+        self.btn_stem_r_anc.setFixedHeight(22)
+        self.btn_stem_r_anc.setCursor(Qt.PointingHandCursor)
+        self.btn_stem_r_anc.setObjectName("segSubBtn")
+        self.btn_stem_r_anc.clicked.connect(lambda: self.set_stem_config(right="anc"))
+        sr_layout.addWidget(self.btn_stem_r_anc)
+
+        self.btn_stem_r_siri = QPushButton("Siri / Trợ lý")
+        self.btn_stem_r_siri.setFixedHeight(22)
+        self.btn_stem_r_siri.setCursor(Qt.PointingHandCursor)
+        self.btn_stem_r_siri.setObjectName("segSubBtn")
+        self.btn_stem_r_siri.clicked.connect(lambda: self.set_stem_config(right="siri"))
+        sr_layout.addWidget(self.btn_stem_r_siri)
+        rr_layout.addWidget(self.stem_r_bar)
+        st_layout.addWidget(r_right)
+
+        # Row 3: Squeeze / Swipe Speed (Tốc độ bóp & vuốt)
+        r_speed = QWidget()
+        rsp_layout = QHBoxLayout(r_speed)
+        rsp_layout.setContentsMargins(0, 1, 0, 1)
+        rsp_layout.setSpacing(8)
+
+        self.ic_stem_speed = QLabel()
+        self.ic_stem_speed.setFixedSize(20, 20)
+        self.ic_stem_speed.setAlignment(Qt.AlignCenter)
+        self.ic_stem_speed.setObjectName("iconBox")
+        self.ic_stem_speed.setProperty("icon_name", "adjustments-horizontal")
+        rsp_layout.addWidget(self.ic_stem_speed)
+
+        lbl_spd = QLabel("Tốc độ phản hồi:")
+        lbl_spd.setFont(QFont("SF Pro Text", 10.5, QFont.Medium))
+        rsp_layout.addWidget(lbl_spd)
+        rsp_layout.addStretch()
+
+        self.speed_bar = QFrame()
+        self.speed_bar.setObjectName("segmentedBar")
+        spd_layout = QHBoxLayout(self.speed_bar)
+        spd_layout.setContentsMargins(2, 2, 2, 2)
+        spd_layout.setSpacing(2)
+
+        self.speed_buttons = {}
+        for spd_val, spd_text in [(0, "Chuẩn"), (1, "Chậm"), (2, "Rất chậm")]:
+            b_spd = QPushButton(spd_text)
+            b_spd.setFixedHeight(22)
+            b_spd.setCursor(Qt.PointingHandCursor)
+            b_spd.setObjectName("segSubBtn")
+            b_spd.clicked.connect(lambda chk=False, v=spd_val: self.set_stem_speed(v))
+            spd_layout.addWidget(b_spd)
+            self.speed_buttons[spd_val] = b_spd
+        rsp_layout.addWidget(self.speed_bar)
+        st_layout.addWidget(r_speed)
+
+        layout.addWidget(self.stem_card)
+
+        # ================= 6. Smart Features Group (iOS Settings Table Style) =================
         self.smart_card = QFrame()
         self.smart_card.setObjectName("card")
         sf_layout = QVBoxLayout(self.smart_card)
@@ -1046,6 +1202,15 @@ class AirPodsManager(QMainWindow):
         self.ic_bat_r.setPixmap(load_tinted_pixmap("airpod-right", subtle_icon, (16, 16)))
         self.ic_bat_c.setPixmap(load_tinted_pixmap("airpod-case", subtle_icon, (16, 16)))
 
+        # Rename button & Stem icons
+        if hasattr(self, 'btn_rename'):
+            self.btn_rename.setIcon(load_tinted_icon("pencil-square", subtle_icon, (13, 13)))
+        if hasattr(self, 'ic_stem_left'):
+            self.ic_stem_left.setPixmap(load_tinted_pixmap("airpod-left", subtle_icon, (15, 15)))
+            self.ic_stem_right.setPixmap(load_tinted_pixmap("airpod-right", subtle_icon, (15, 15)))
+            self.ic_stem_speed.setPixmap(load_tinted_pixmap("adjustments-horizontal", subtle_icon, (15, 15)))
+            self.update_stem_ui()
+
         self.update_airpods_logo()
         self.update_mode_ui()
         self.update_tune_ui()
@@ -1068,6 +1233,74 @@ class AirPodsManager(QMainWindow):
             btn.setObjectName("segSubBtnActive" if val == self.adaptive_strength else "segSubBtn")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+
+    def update_stem_ui(self):
+        if hasattr(self, 'btn_stem_l_anc'):
+            self.btn_stem_l_anc.setObjectName("segSubBtnActive" if self.stem_left == "anc" else "segSubBtn")
+            self.btn_stem_l_anc.style().unpolish(self.btn_stem_l_anc)
+            self.btn_stem_l_anc.style().polish(self.btn_stem_l_anc)
+
+            self.btn_stem_l_siri.setObjectName("segSubBtnActive" if self.stem_left == "siri" else "segSubBtn")
+            self.btn_stem_l_siri.style().unpolish(self.btn_stem_l_siri)
+            self.btn_stem_l_siri.style().polish(self.btn_stem_l_siri)
+
+            self.btn_stem_r_anc.setObjectName("segSubBtnActive" if self.stem_right == "anc" else "segSubBtn")
+            self.btn_stem_r_anc.style().unpolish(self.btn_stem_r_anc)
+            self.btn_stem_r_anc.style().polish(self.btn_stem_r_anc)
+
+            self.btn_stem_r_siri.setObjectName("segSubBtnActive" if self.stem_right == "siri" else "segSubBtn")
+            self.btn_stem_r_siri.style().unpolish(self.btn_stem_r_siri)
+            self.btn_stem_r_siri.style().polish(self.btn_stem_r_siri)
+
+            for val, btn in self.speed_buttons.items():
+                btn.setObjectName("segSubBtnActive" if val == self.stem_speed else "segSubBtn")
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+
+    def on_rename_clicked(self):
+        curr = self.lbl_title.text().strip()
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Đổi tên AirPods",
+            "Nhập tên mới để lưu trực tiếp vào firmware phần cứng AirPods:",
+            QLineEdit.Normal,
+            curr
+        )
+        if ok and new_name.strip():
+            cleaned = new_name.strip()
+            self.lbl_title.setText(cleaned)
+            self.lbl_msg.setText("Đang ghi tên mới vào firmware AirPods...")
+            resp = send_daemon_cmd(f"rename {cleaned}")
+            if resp.startswith("OK"):
+                self.lbl_msg.setText(f"✓ Đã đổi tên AirPods thành '{cleaned}'")
+            else:
+                self.lbl_msg.setText(f"Lỗi: {resp}")
+
+    def set_stem_config(self, left=None, right=None):
+        if left is not None:
+            self.stem_left = left
+        if right is not None:
+            self.stem_right = right
+        self.update_stem_ui()
+        self.save_settings()
+        resp = send_daemon_cmd(f"stem left={self.stem_left} right={self.stem_right}")
+        l_name = "Chống ồn" if self.stem_left == "anc" else "Siri"
+        r_name = "Chống ồn" if self.stem_right == "anc" else "Siri"
+        if resp.startswith("OK"):
+            self.lbl_msg.setText(f"✓ Bóp giữ: Trái [{l_name}] • Phải [{r_name}]")
+        else:
+            self.lbl_msg.setText(f"Lỗi: {resp}")
+
+    def set_stem_speed(self, speed):
+        self.stem_speed = speed
+        self.update_stem_ui()
+        self.save_settings()
+        resp = send_daemon_cmd(f"stem_speed {speed}")
+        labels = ["Chuẩn", "Chậm", "Rất chậm"]
+        if resp.startswith("OK"):
+            self.lbl_msg.setText(f"✓ Đã đặt tốc độ phản hồi: {labels[speed]}")
+        else:
+            self.lbl_msg.setText(f"Lỗi: {resp}")
 
     def set_noise_mode(self, mode_name):
         self.current_mode = mode_name
@@ -1286,6 +1519,35 @@ class AirPodsManager(QMainWindow):
                 elif key == "idle_rel":
                     sw.setChecked(props.get("idle_rel") == "1")
                 sw.blockSignals(False)
+
+            # Sync AirPods hardware device name
+            raw_dev_name = props.get("dev_name")
+            if raw_dev_name:
+                dev_name = urllib.parse.unquote(raw_dev_name).strip()
+                if dev_name and self.lbl_title.text() != dev_name:
+                    self.lbl_title.setText(dev_name)
+
+            # Sync stem press & speed
+            stem_l = props.get("stem_l")
+            stem_r = props.get("stem_r")
+            stem_spd = props.get("stem_spd")
+            changed_stem = False
+            if stem_l and stem_l != self.stem_left:
+                self.stem_left = stem_l
+                changed_stem = True
+            if stem_r and stem_r != self.stem_right:
+                self.stem_right = stem_r
+                changed_stem = True
+            if stem_spd is not None:
+                try:
+                    s_val = int(stem_spd)
+                    if s_val != self.stem_speed:
+                        self.stem_speed = s_val
+                        changed_stem = True
+                except ValueError:
+                    pass
+            if changed_stem:
+                self.update_stem_ui()
 
     def set_default_art(self):
         dpr = get_dpr()
